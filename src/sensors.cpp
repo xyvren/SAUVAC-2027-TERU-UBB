@@ -10,6 +10,9 @@ namespace {
 
 SensorData currentSensorData{};
 SensorData publishedSensorData{};
+SensorData injectedData{};
+bool injectionActive = false;
+uint32_t lastInjectionMs = 0;
 critical_section_t stateLock;
 bool stateLockInitialized = false;
 
@@ -348,12 +351,39 @@ void update(const Config::Settings& settings) {
 
 void snapshot(SensorData& dest) {
   if (!stateLockInitialized) {
-    dest = currentSensorData;
+    if (injectionActive && (millis() - lastInjectionMs < 500)) {
+      dest = injectedData;
+    } else {
+      dest = currentSensorData;
+    }
     return;
   }
   critical_section_enter_blocking(&stateLock);
-  dest = publishedSensorData;
+  if (injectionActive && (millis() - lastInjectionMs < 500)) {
+    dest = injectedData;
+  } else {
+    dest = publishedSensorData;
+  }
   critical_section_exit(&stateLock);
+}
+
+void setInjectedData(const SensorData& data) {
+  if (!stateLockInitialized) {
+    injectedData = data;
+    injectionActive = true;
+    lastInjectionMs = millis();
+    return;
+  }
+  critical_section_enter_blocking(&stateLock);
+  injectedData = data;
+  injectionActive = true;
+  lastInjectionMs = millis();
+  critical_section_exit(&stateLock);
+}
+
+bool isInjectionActive() {
+  if (!injectionActive) return false;
+  return (millis() - lastInjectionMs < 500);
 }
 
 bool calibrateDepthZero(Config::Settings& settings) {

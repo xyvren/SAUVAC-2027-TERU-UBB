@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "config.h"
 #include "sensors.h"
+#include "mission.h"
 
 namespace CLI {
 
@@ -17,6 +18,18 @@ struct MotorControlInterface {
   void (*setPidState)(bool enabled);
   bool (*saveSettings)();
   void (*resetDefaults)();
+
+  // Mission & Auto-Run hooks
+  bool (*startMission)(bool immediate);
+  void (*cancelMission)();
+  bool (*isMissionActive)();
+  bool (*isCountdownActive)();
+  int (*getCountdownRemaining)();
+  bool (*calibrateDepthZero)();
+  bool (*calibrateImuLevel)();
+  void (*onInjected)();
+  void (*setTargetDepth)(float targetCm);
+  float (*getTargetDepth)();
 };
 
 void begin(const MotorControlInterface& iface);

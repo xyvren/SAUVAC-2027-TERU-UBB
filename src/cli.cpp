@@ -21,6 +21,7 @@ constexpr const char* ANSI_WHITE   = "\033[37m";
 constexpr const char* ANSI_BOLD_RED    = "\033[1;31m";
 constexpr const char* ANSI_BOLD_GREEN  = "\033[1;32m";
 constexpr const char* ANSI_BOLD_YELLOW = "\033[1;33m";
+constexpr const char* ANSI_BOLD_MAGENTA = "\033[1;35m";
 constexpr const char* ANSI_BOLD_CYAN   = "\033[1;36m";
 constexpr const char* ANSI_BOLD_WHITE  = "\033[1;37m";
 
@@ -30,6 +31,29 @@ bool initialized = false;
 String inputBuffer = "";
 bool sensorStreamActive = false;
 uint32_t lastSensorStreamAt = 0;
+uint32_t streamStartedAt = 0;
+
+// JSON Upload Engine State
+bool jsonUploadMode = false;
+String jsonUploadBuffer = "";
+uint32_t jsonUploadStartedAt = 0;
+
+// Robust float to String formatter (guaranteed to render regardless of libc printf_float link status)
+String fmtFloat(float val, int decimals = 1, int width = 0, bool forceSign = false) {
+  String s;
+  if (forceSign && val >= 0.0f) {
+    s = "+";
+    s += String(val, decimals);
+  } else {
+    s = String(val, decimals);
+  }
+  if (width > 0) {
+    while (static_cast<int>(s.length()) < width) {
+      s = " " + s;
+    }
+  }
+  return s;
+}
 
 size_t tokenize(const String& cmd, String tokens[], size_t maxTokens) {
   size_t count = 0;
@@ -80,6 +104,17 @@ void printHelp() {
   Serial.println(F("  stop                       : EMERGENCY STOP: Neutralize all motors immediately"));
 
   Serial.print(ANSI_BOLD_YELLOW);
+  Serial.println(F("\r\n[ AUTONOMOUS MISSION & AUTORUN ]"));
+  Serial.print(ANSI_RESET);
+  Serial.println(F("  run [now]                  : Start autonomous mission (with countdown or 'now')"));
+  Serial.println(F("  autorun <on|off>           : Enable/disable auto-run countdown on Pico W boot"));
+  Serial.println(F("  autorun delay <3-60>       : Set boot launch countdown delay in seconds (default: 10)"));
+  Serial.println(F("  autorun status             : View auto-run configuration and calibration status"));
+  Serial.println(F("  jalur, mission             : Display ASCII table of loaded mission steps"));
+  Serial.println(F("  jalur default              : Restore default sample trajectory to /jalur.json"));
+  Serial.println(F("  jalur upload               : Upload JSON trajectory payload via serial"));
+
+  Serial.print(ANSI_BOLD_YELLOW);
   Serial.println(F("\r\n[ THRUSTER TUNING & BENCH TESTING ]"));
   Serial.print(ANSI_RESET);
   Serial.println(F("  thrusters, motor           : Table of all 6 thrusters (pins, pulses, reverse, trim)"));
@@ -124,7 +159,13 @@ void printStatus() {
 
   // System State
   Serial.print(F("State            : "));
-  if (iface.armed && *iface.armed) {
+  if (iface.isCountdownActive && iface.isCountdownActive()) {
+    Serial.print(ANSI_BOLD_CYAN);
+    Serial.printf("[ COUNTDOWN ACTIVE (T-%ds) ]", iface.getCountdownRemaining ? iface.getCountdownRemaining() : 0);
+  } else if (iface.isMissionActive && iface.isMissionActive()) {
+    Serial.print(ANSI_BOLD_GREEN);
+    Serial.print(F("[ MISSION RUNNING ]"));
+  } else if (iface.armed && *iface.armed) {
     Serial.print(ANSI_BOLD_GREEN);
     Serial.print(F("[ ARMED / ACTIVE ]"));
   } else {
@@ -143,6 +184,21 @@ void printStatus() {
   }
   Serial.print(ANSI_RESET);
 
+  // Auto-Run and Mission info
+  Serial.print(F("Auto-Run on Boot : "));
+  if (iface.settings->autoRunEnabled) {
+    Serial.print(ANSI_BOLD_GREEN);
+    Serial.printf("ENABLED (%u s countdown delay)\r\n", iface.settings->autoRunDelaySec);
+  } else {
+    Serial.print(ANSI_YELLOW);
+    Serial.println(F("DISABLED"));
+  }
+  Serial.print(ANSI_RESET);
+
+  Serial.printf("Mission Jalur    : %u steps loaded (%.1f s total duration)\r\n",
+                static_cast<unsigned>(Mission::getStepCount()),
+                Mission::getTotalDurationSec());
+
   // Power Limit
   Serial.print(F("Safety Cap       : "));
   Serial.print(ANSI_BOLD_CYAN);
@@ -159,6 +215,11 @@ void printStatus() {
   Serial.print(ANSI_RESET);
 
   Serial.println(F("-------------------------------------------------------------------------------"));
+  if (Sensors::isInjectionActive()) {
+    Serial.print(ANSI_BOLD_MAGENTA);
+    Serial.println(F("  *** SIMULATION SENSOR INJECTION ACTIVE ***"));
+    Serial.print(ANSI_RESET);
+  }
   Serial.print(ANSI_BOLD_WHITE);
   Serial.println(F("[ SENSOR TELEMETRY ]"));
   Serial.print(ANSI_RESET);
@@ -169,12 +230,14 @@ void printStatus() {
     Serial.print(ANSI_GREEN);
     Serial.print(F("ONLINE"));
     Serial.print(ANSI_RESET);
-    Serial.printf(" | Pressure: %6.1f mbar | Temp: %4.1f °C\r\n",
-                  sensor.pressureMbar, sensor.temperatureC);
-    Serial.printf("                   Depth   : %6.1f cm ", sensor.depthCm);
+    Serial.printf(" | Pressure: %s mbar | Temp: %s °C\r\n",
+                  fmtFloat(sensor.pressureMbar, 1, 6).c_str(),
+                  fmtFloat(sensor.temperatureC, 1, 4).c_str());
+    Serial.printf("                   Depth   : %s cm ",
+                  fmtFloat(sensor.depthCm, 1, 6).c_str());
     if (iface.settings->depthZeroCalibrated) {
-      Serial.printf("(Zero Ref: %.1f mbar - CALIBRATED)\r\n",
-                    iface.settings->depthZeroPressureMbar);
+      Serial.printf("(Zero Ref: %s mbar - CALIBRATED)\r\n",
+                    fmtFloat(iface.settings->depthZeroPressureMbar, 1).c_str());
     } else {
       Serial.print(ANSI_YELLOW);
       Serial.println(F("(NOT ZEROED - Run 'calib zero' at surface)"));
@@ -192,12 +255,18 @@ void printStatus() {
     Serial.print(ANSI_GREEN);
     Serial.print(F("ONLINE"));
     Serial.print(ANSI_RESET);
-    Serial.printf(" | Pitch: %+5.1f° (raw %+5.1f°, off %+4.1f°)\r\n",
-                  sensor.pitch, sensor.rawPitch, iface.settings->pitchOffset);
-    Serial.printf("                   Roll : %+5.1f° (raw %+5.1f°, off %+4.1f°)\r\n",
-                  sensor.roll, sensor.rawRoll, iface.settings->rollOffset);
-    Serial.printf("                   Gyro : X=%+5.1f, Y=%+5.1f, Z=%+5.1f dps\r\n",
-                  sensor.gyroDps[0], sensor.gyroDps[1], sensor.gyroDps[2]);
+    Serial.printf(" | Pitch: %s° (raw %s°, off %s°)\r\n",
+                  fmtFloat(sensor.pitch, 1, 5, true).c_str(),
+                  fmtFloat(sensor.rawPitch, 1, 5, true).c_str(),
+                  fmtFloat(iface.settings->pitchOffset, 1, 4, true).c_str());
+    Serial.printf("                   Roll : %s° (raw %s°, off %s°)\r\n",
+                  fmtFloat(sensor.roll, 1, 5, true).c_str(),
+                  fmtFloat(sensor.rawRoll, 1, 5, true).c_str(),
+                  fmtFloat(iface.settings->rollOffset, 1, 4, true).c_str());
+    Serial.printf("                   Gyro : X=%s, Y=%s, Z=%s dps\r\n",
+                  fmtFloat(sensor.gyroDps[0], 1, 5, true).c_str(),
+                  fmtFloat(sensor.gyroDps[1], 1, 5, true).c_str(),
+                  fmtFloat(sensor.gyroDps[2], 1, 5, true).c_str());
   } else {
     Serial.print(ANSI_RED);
     Serial.println(F("OFFLINE / NOT DETECTED (Check I2C SDA=GP26, SCL=GP27)"));
@@ -221,12 +290,18 @@ void printStatus() {
   Serial.print(ANSI_BOLD_WHITE);
   Serial.println(F("[ ACTIVE PID GAINS ]"));
   Serial.print(ANSI_RESET);
-  Serial.printf("  Depth : Kp=%.3f, Ki=%.3f, Kd=%.3f\r\n",
-                iface.settings->pidDepth.kp, iface.settings->pidDepth.ki, iface.settings->pidDepth.kd);
-  Serial.printf("  Roll  : Kp=%.3f, Ki=%.3f, Kd=%.3f\r\n",
-                iface.settings->pidRoll.kp, iface.settings->pidRoll.ki, iface.settings->pidRoll.kd);
-  Serial.printf("  Pitch : Kp=%.3f, Ki=%.3f, Kd=%.3f\r\n",
-                iface.settings->pidPitch.kp, iface.settings->pidPitch.ki, iface.settings->pidPitch.kd);
+  Serial.printf("  Depth : Kp=%s, Ki=%s, Kd=%s\r\n",
+                fmtFloat(iface.settings->pidDepth.kp, 3).c_str(),
+                fmtFloat(iface.settings->pidDepth.ki, 3).c_str(),
+                fmtFloat(iface.settings->pidDepth.kd, 3).c_str());
+  Serial.printf("  Roll  : Kp=%s, Ki=%s, Kd=%s\r\n",
+                fmtFloat(iface.settings->pidRoll.kp, 3).c_str(),
+                fmtFloat(iface.settings->pidRoll.ki, 3).c_str(),
+                fmtFloat(iface.settings->pidRoll.kd, 3).c_str());
+  Serial.printf("  Pitch : Kp=%s, Ki=%s, Kd=%s\r\n",
+                fmtFloat(iface.settings->pidPitch.kp, 3).c_str(),
+                fmtFloat(iface.settings->pidPitch.ki, 3).c_str(),
+                fmtFloat(iface.settings->pidPitch.kd, 3).c_str());
   Serial.println(F("═══════════════════════════════════════════════════════════════════════════════"));
 }
 
@@ -246,14 +321,14 @@ void printThrusterTable() {
 
   for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
     const auto& t = iface.settings->thrusters[i];
-    Serial.printf("|  %u | GP%-2u |     %4u |         %4u |     %4u |   %s   |        %4.2fx       |\r\n",
+    Serial.printf("|  %u | GP%-2u |     %4u |         %4u |     %4u |   %s   |        %sx       |\r\n",
                   static_cast<unsigned>(i + 1),
                   t.pin,
                   t.pulseMin,
                   t.pulseNeutral,
                   t.pulseMax,
                   t.reverse ? "YES" : " NO",
-                  t.trim);
+                  fmtFloat(t.trim, 2, 4).c_str());
   }
   Serial.println(F("+----+------+----------+--------------+----------+---------+--------------------+"));
   Serial.printf("Global Safety Power Limit: %u%% | Cap Status: %s\r\n\r\n",
@@ -264,9 +339,15 @@ void printThrusterTable() {
 void printSensorSnapshot() {
   Sensors::SensorData s{};
   Sensors::snapshot(s);
-  Serial.printf("[SENSOR SNAPSHOT] Depth: %5.1f cm | Pres: %6.1f mbar | Pitch: %+5.1f° | Roll: %+5.1f° | Gyro: [%+5.1f, %+5.1f, %+5.1f] dps | Temp: %4.1f°C\r\n",
-                s.depthCm, s.pressureMbar, s.pitch, s.roll,
-                s.gyroDps[0], s.gyroDps[1], s.gyroDps[2], s.temperatureC);
+  Serial.printf("[SENSOR SNAPSHOT] Depth: %s cm | Pres: %s mbar | Pitch: %s° | Roll: %s° | Gyro: [%s, %s, %s] dps | Temp: %s°C\r\n",
+                fmtFloat(s.depthCm, 1, 5).c_str(),
+                fmtFloat(s.pressureMbar, 1, 6).c_str(),
+                fmtFloat(s.pitch, 1, 5, true).c_str(),
+                fmtFloat(s.roll, 1, 5, true).c_str(),
+                fmtFloat(s.gyroDps[0], 1, 5, true).c_str(),
+                fmtFloat(s.gyroDps[1], 1, 5, true).c_str(),
+                fmtFloat(s.gyroDps[2], 1, 5, true).c_str(),
+                fmtFloat(s.temperatureC, 1, 4).c_str());
 }
 
 void handleCommand(const String& rawCmd) {
@@ -304,6 +385,7 @@ void handleCommand(const String& rawCmd) {
       sub.toLowerCase();
       if (sub == "stream" || sub == "on" || sub == "1") {
         sensorStreamActive = true;
+        streamStartedAt = millis();
         Serial.print(ANSI_GREEN);
         Serial.println(F("[STREAM] Live sensor stream STARTED (5Hz). Press any key to stop."));
         Serial.print(ANSI_RESET);
@@ -487,7 +569,8 @@ void handleCommand(const String& rawCmd) {
           iface.settings->depthZeroPressureMbar = manualPres;
           iface.settings->depthZeroCalibrated = 1;
           Serial.print(ANSI_GREEN);
-          Serial.printf("OK: Surface depth reference pressure set to %.1f mbar (manual). Depth zeroed!\r\n", manualPres);
+          Serial.printf("OK: Surface depth reference pressure set to %s mbar (manual). Depth zeroed!\r\n",
+                        fmtFloat(manualPres, 1).c_str());
           Serial.print(ANSI_RESET);
           Serial.println(F("Type 'save' to commit to EEPROM."));
           return;
@@ -498,8 +581,8 @@ void handleCommand(const String& rawCmd) {
       }
       if (Sensors::calibrateDepthZero(*iface.settings)) {
         Serial.print(ANSI_GREEN);
-        Serial.printf("OK: Surface depth reference pressure set to %.1f mbar. Depth zeroed!\r\n",
-                      iface.settings->depthZeroPressureMbar);
+        Serial.printf("OK: Surface depth reference pressure set to %s mbar. Depth zeroed!\r\n",
+                      fmtFloat(iface.settings->depthZeroPressureMbar, 1).c_str());
         Serial.print(ANSI_RESET);
         Serial.println(F("Type 'save' to commit to EEPROM."));
       } else {
@@ -515,15 +598,17 @@ void handleCommand(const String& rawCmd) {
         iface.settings->pitchOffset = pOff;
         iface.settings->rollOffset = rOff;
         Serial.print(ANSI_GREEN);
-        Serial.printf("OK: IMU level offsets set to Pitch: %+.2f°, Roll: %+.2f° (manual). Robot leveled!\r\n", pOff, rOff);
+        Serial.printf("OK: IMU level offsets set to Pitch: %s°, Roll: %s° (manual). Robot leveled!\r\n",
+                      fmtFloat(pOff, 2, 0, true).c_str(), fmtFloat(rOff, 2, 0, true).c_str());
         Serial.print(ANSI_RESET);
         Serial.println(F("Type 'save' to commit to EEPROM."));
         return;
       }
       if (Sensors::calibrateImuLevel(*iface.settings)) {
         Serial.print(ANSI_GREEN);
-        Serial.printf("OK: IMU level offsets recorded (Pitch: %+.2f°, Roll: %+.2f°). Robot leveled!\r\n",
-                      iface.settings->pitchOffset, iface.settings->rollOffset);
+        Serial.printf("OK: IMU level offsets recorded (Pitch: %s°, Roll: %s°). Robot leveled!\r\n",
+                      fmtFloat(iface.settings->pitchOffset, 2, 0, true).c_str(),
+                      fmtFloat(iface.settings->rollOffset, 2, 0, true).c_str());
         Serial.print(ANSI_RESET);
         Serial.println(F("Type 'save' to commit to EEPROM."));
       } else {
@@ -577,8 +662,11 @@ void handleCommand(const String& rawCmd) {
       }
 
       Serial.print(ANSI_GREEN);
-      Serial.printf("OK: %s PID gains set to Kp=%.4f, Ki=%.4f, Kd=%.4f. Type 'save' to commit.\r\n",
-                    sub.c_str(), kp, ki, kd);
+      Serial.printf("OK: %s PID gains set to Kp=%s, Ki=%s, Kd=%s. Type 'save' to commit.\r\n",
+                    sub.c_str(),
+                    fmtFloat(kp, 4).c_str(),
+                    fmtFloat(ki, 4).c_str(),
+                    fmtFloat(kd, 4).c_str());
       Serial.print(ANSI_RESET);
       return;
     } else {
@@ -612,7 +700,8 @@ void handleCommand(const String& rawCmd) {
   }
 
   // 12. STOP / DISARM
-  if (root == "stop" || root == "disarm") {
+  if (root == "stop" || root == "disarm" || root == "abort") {
+    if (iface.cancelMission) iface.cancelMission();
     if (iface.emergencyStop) iface.emergencyStop();
     Serial.print(ANSI_BOLD_RED);
     Serial.println(F("[EMERGENCY STOP] All 6 thrusters neutralized immediately (1500us). Disarmed."));
@@ -620,9 +709,203 @@ void handleCommand(const String& rawCmd) {
     return;
   }
 
+  // 13. AUTORUN
+  if (root == "autorun") {
+    if (tokenCount < 2 || tokens[1].equalsIgnoreCase("status")) {
+      Serial.println();
+      Serial.print(ANSI_BOLD_CYAN);
+      Serial.println(F("╔═════════════════════════════════════════════════════════════════════════════╗"));
+      Serial.println(F("║                   AUTORUN & AUTONOMOUS MISSION STATUS                       ║"));
+      Serial.println(F("╚═════════════════════════════════════════════════════════════════════════════╝"));
+      Serial.print(ANSI_RESET);
+
+      Serial.print(F("Auto-Run on Boot : "));
+      if (iface.settings->autoRunEnabled) {
+        Serial.print(ANSI_BOLD_GREEN);
+        Serial.println(F("ENABLED"));
+      } else {
+        Serial.print(ANSI_YELLOW);
+        Serial.println(F("DISABLED"));
+      }
+      Serial.print(ANSI_RESET);
+
+      Serial.printf("Countdown Delay  : %u seconds (range: 3-60s)\r\n", iface.settings->autoRunDelaySec);
+      Serial.println(F("Surface Tare     : Automatic at T-3s (MS5803 depth zero calibration)"));
+      Serial.println(F("IMU Leveling     : Automatic at T-2s (MPU-6050 Pitch/Roll zero calibration)"));
+      Serial.printf("Trajectory File  : /jalur.json (%u steps loaded, %.1f s duration)\r\n",
+                    static_cast<unsigned>(Mission::getStepCount()),
+                    Mission::getTotalDurationSec());
+      Serial.println(F("EEPROM Status    : Persist settings across boots with 'save' command."));
+      Serial.println();
+      return;
+    }
+
+    String sub = tokens[1];
+    sub.toLowerCase();
+    if (sub == "on" || sub == "1" || sub == "enable") {
+      iface.settings->autoRunEnabled = 1;
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Auto-run on boot ENABLED (%u s countdown). Type 'save' to commit to EEPROM.\r\n",
+                    iface.settings->autoRunDelaySec);
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "off" || sub == "0" || sub == "disable") {
+      iface.settings->autoRunEnabled = 0;
+      Serial.print(ANSI_YELLOW);
+      Serial.println(F("OK: Auto-run on boot DISABLED. Type 'save' to commit to EEPROM."));
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "delay") {
+      if (tokenCount < 3) {
+        Serial.println(F("Usage: autorun delay <seconds 3-60>"));
+        return;
+      }
+      int sec = tokens[2].toInt();
+      if (sec < 3 || sec > 60) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: Delay must be between 3 and 60 seconds."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      iface.settings->autoRunDelaySec = static_cast<uint8_t>(sec);
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Countdown delay set to %d seconds. Type 'save' to commit to EEPROM.\r\n", sec);
+      Serial.print(ANSI_RESET);
+      return;
+    } else {
+      Serial.printf("ERROR: Unknown autorun option '%s'. Use 'on', 'off', 'delay <sec>', or 'status'.\r\n", sub.c_str());
+      return;
+    }
+  }
+
+  // 14. RUN
+  if (root == "run") {
+    if (tokenCount > 1 && tokens[1].equalsIgnoreCase("now")) {
+      if (iface.startMission) iface.startMission(true);
+      return;
+    }
+    if (iface.startMission) iface.startMission(false);
+    return;
+  }
+
+  // 15. JALUR / MISSION
+  if (root == "jalur" || root == "mission") {
+    if (tokenCount > 1) {
+      String sub = tokens[1];
+      sub.toLowerCase();
+      if (sub == "default" || sub == "reset") {
+        if (Mission::saveDefaultFile()) {
+          Serial.print(ANSI_GREEN);
+          Serial.println(F("OK: Default trajectory restored and saved to /jalur.json!"));
+          Serial.print(ANSI_RESET);
+          Mission::printMissionTable();
+        } else {
+          Serial.print(ANSI_RED);
+          Serial.println(F("ERROR: Failed to save default trajectory to /jalur.json on LittleFS."));
+          Serial.print(ANSI_RESET);
+        }
+        return;
+      } else if (sub == "upload") {
+        jsonUploadMode = true;
+        jsonUploadBuffer = "";
+        jsonUploadStartedAt = millis();
+        Serial.print(ANSI_BOLD_CYAN);
+        Serial.println(F("[UPLOAD] READY. Send JSON payload followed by '===EOF===' (30s timeout)..."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+    }
+    Mission::printMissionTable();
+    return;
+  }
+
+  // 15. DEPTH / TARGET DEPTH
+  if (root == "depth" || (root == "target" && tokenCount > 1 && tokens[1].equalsIgnoreCase("depth"))) {
+    size_t valIdx = (root == "depth") ? 1 : 2;
+    if (tokenCount <= valIdx) {
+      Sensors::SensorData s{};
+      Sensors::snapshot(s);
+      Serial.printf("Current Depth: %.1f cm", s.depthCm);
+      if (iface.getTargetDepth) {
+        Serial.printf(" | Target Depth: %.1f cm", iface.getTargetDepth());
+      }
+      Serial.println();
+      return;
+    }
+    float target = tokens[valIdx].toFloat();
+    if (iface.setTargetDepth) {
+      iface.setTargetDepth(target);
+      Serial.printf("[DEPTH] Target depth set to %.1f cm.\r\n", target);
+    }
+    return;
+  }
+
   Serial.print(ANSI_RED);
   Serial.printf("ERROR: Unknown command '%s'. Type 'help' or '?' for available commands.\r\n", tokens[0].c_str());
   Serial.print(ANSI_RESET);
+}
+
+void handleInjPacket(const String& packet) {
+  int starIdx = packet.indexOf('*');
+  String clean = (starIdx >= 0) ? packet.substring(0, starIdx) : packet;
+
+  const char* p = clean.c_str();
+  if (strncmp(p, "$INJ,", 5) != 0) {
+    return;
+  }
+  p += 5;
+
+  char* endp = nullptr;
+  float depth = strtof(p, &endp);
+  if (endp && *endp == ',') p = endp + 1;
+  float pitch = strtof(p, &endp);
+  if (endp && *endp == ',') p = endp + 1;
+  float roll = strtof(p, &endp);
+  if (endp && *endp == ',') p = endp + 1;
+  float gx = strtof(p, &endp);
+  if (endp && *endp == ',') p = endp + 1;
+  float gy = strtof(p, &endp);
+  if (endp && *endp == ',') p = endp + 1;
+  float gz = strtof(p, &endp);
+
+  Sensors::SensorData data{};
+  data.depthCm = depth;
+  data.pitch = pitch;
+  data.roll = roll;
+  data.rawPitch = pitch;
+  data.rawRoll = roll;
+  data.gyroDps[0] = gx;
+  data.gyroDps[1] = gy;
+  data.gyroDps[2] = gz;
+
+  float pitchRad = pitch * 0.0174532925f;
+  float rollRad = roll * 0.0174532925f;
+  data.accelG[0] = -sinf(pitchRad);
+  data.accelG[1] = sinf(rollRad) * cosf(pitchRad);
+  data.accelG[2] = cosf(rollRad) * cosf(pitchRad);
+  data.pressureMbar = 1013.25f + (depth * 0.980665f);
+  data.temperatureC = 25.0f;
+  data.imuReady = true;
+  data.pressureReady = true;
+  data.i2cReady = true;
+  data.lastUpdateMs = millis();
+  data.sampleCount++;
+
+  Sensors::setInjectedData(data);
+
+  if (iface.onInjected) {
+    iface.onInjected();
+  }
+
+  char actBuf[64];
+  snprintf(actBuf, sizeof(actBuf), "$ACT,%u,%u,%u,%u,%u,%u\r\n",
+           iface.getCurrentPulse ? iface.getCurrentPulse(0) : 1500,
+           iface.getCurrentPulse ? iface.getCurrentPulse(1) : 1500,
+           iface.getCurrentPulse ? iface.getCurrentPulse(2) : 1500,
+           iface.getCurrentPulse ? iface.getCurrentPulse(3) : 1500,
+           iface.getCurrentPulse ? iface.getCurrentPulse(4) : 1500,
+           iface.getCurrentPulse ? iface.getCurrentPulse(5) : 1500);
+  Serial.print(actBuf);
 }
 
 }  // namespace
@@ -656,21 +939,88 @@ void printPrompt() {
 }
 
 void update() {
+  // Check for JSON Upload Mode (transferring /jalur.json over Serial)
+  if (jsonUploadMode) {
+    if (millis() - jsonUploadStartedAt > 30000) {
+      jsonUploadMode = false;
+      jsonUploadBuffer = "";
+      Serial.println(F("\r\n[UPLOAD] ERROR: Timeout waiting for JSON payload (30s)."));
+      printPrompt();
+      return;
+    }
+
+    while (Serial.available()) {
+      char c = static_cast<char>(Serial.read());
+      jsonUploadBuffer += c;
+
+      if (jsonUploadBuffer.endsWith("===EOF===\r\n") || jsonUploadBuffer.endsWith("===EOF===\n") ||
+          jsonUploadBuffer.endsWith("@EOF\r\n") || jsonUploadBuffer.endsWith("@EOF\n")) {
+        int eofIdx = jsonUploadBuffer.indexOf("===EOF===");
+        if (eofIdx < 0) eofIdx = jsonUploadBuffer.indexOf("@EOF");
+        if (eofIdx >= 0) {
+          jsonUploadBuffer = jsonUploadBuffer.substring(0, eofIdx);
+        }
+        jsonUploadBuffer.trim();
+
+        jsonUploadMode = false;
+        String err;
+        if (Mission::saveJsonString(jsonUploadBuffer, err)) {
+          Serial.println(F("\r\n[UPLOAD] SUCCESS: Mission trajectory updated in /jalur.json!"));
+          Mission::printMissionTable();
+        } else {
+          Serial.printf("\r\n[UPLOAD] ERROR: Failed to save JSON: %s\r\n", err.c_str());
+        }
+        jsonUploadBuffer = "";
+        printPrompt();
+        return;
+      }
+    }
+    return;
+  }
+
   // Check for incoming serial characters
   while (Serial.available()) {
     char c = static_cast<char>(Serial.read());
 
     // If streaming sensor data, any key stops the stream
     if (sensorStreamActive) {
+      // Discard leftover CRLF from the Enter keypress during the first 350 ms
+      if (millis() - streamStartedAt < 350) {
+        continue;
+      }
+      // Ignore lone newline or carriage return if they arrive
+      if (c == '\r' || c == '\n') {
+        continue;
+      }
       sensorStreamActive = false;
       Serial.println(F("\r\n[STREAM] Sensor stream stopped by user keypress."));
       printPrompt();
-      return;
+      continue;
     }
 
     if (c == '\r' || c == '\n') {
       if (inputBuffer.length() > 0) {
+        if (inputBuffer.startsWith("$INJ")) {
+          handleInjPacket(inputBuffer);
+          inputBuffer = "";
+          continue;
+        }
+
         Serial.println();
+
+        // Check if countdown is active: any command or 'stop' aborts countdown immediately!
+        if (iface.isCountdownActive && iface.isCountdownActive()) {
+          if (iface.cancelMission) iface.cancelMission();
+          Serial.println(F("[AUTORUN] Countdown ABORTED by operator. System returned to IDLE mode."));
+          String cmd = inputBuffer;
+          inputBuffer = "";
+          if (!cmd.equalsIgnoreCase("stop") && !cmd.equalsIgnoreCase("abort") && !cmd.equalsIgnoreCase("disarm")) {
+            handleCommand(cmd);
+          }
+          printPrompt();
+          return;
+        }
+
         handleCommand(inputBuffer);
         inputBuffer = "";
         printPrompt();
@@ -678,11 +1028,15 @@ void update() {
     } else if (c == '\b' || c == 0x7F) {
       if (inputBuffer.length() > 0) {
         inputBuffer.remove(inputBuffer.length() - 1);
-        Serial.print(F("\b \b"));  // Visual backspace
+        if (!inputBuffer.startsWith("$")) {
+          Serial.print(F("\b \b"));  // Visual backspace
+        }
       }
     } else if (c >= 32 && c <= 126) {
       inputBuffer += c;
-      Serial.print(c);  // Echo character
+      if (!inputBuffer.startsWith("$")) {
+        Serial.print(c);  // Echo character
+      }
     }
   }
 
@@ -693,9 +1047,14 @@ void update() {
       lastSensorStreamAt = now;
       Sensors::SensorData s{};
       Sensors::snapshot(s);
-      Serial.printf("[LIVE] P: %+5.1f° | R: %+5.1f° | Depth: %5.1f cm | Pres: %6.1f mbar | Gyro: [%+5.1f, %+5.1f, %+5.1f] dps\r\n",
-                    s.pitch, s.roll, s.depthCm, s.pressureMbar,
-                    s.gyroDps[0], s.gyroDps[1], s.gyroDps[2]);
+      Serial.printf("[LIVE] P: %s° | R: %s° | Depth: %s cm | Pres: %s mbar | Gyro: [%s, %s, %s] dps\r\n",
+                    fmtFloat(s.pitch, 1, 5, true).c_str(),
+                    fmtFloat(s.roll, 1, 5, true).c_str(),
+                    fmtFloat(s.depthCm, 1, 5).c_str(),
+                    fmtFloat(s.pressureMbar, 1, 6).c_str(),
+                    fmtFloat(s.gyroDps[0], 1, 5, true).c_str(),
+                    fmtFloat(s.gyroDps[1], 1, 5, true).c_str(),
+                    fmtFloat(s.gyroDps[2], 1, 5, true).c_str());
     }
   }
 }

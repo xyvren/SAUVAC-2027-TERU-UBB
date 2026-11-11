@@ -32,4 +32,8 @@ void snapshot(SensorData& dest);
 bool calibrateDepthZero(Config::Settings& settings);
 bool calibrateImuLevel(Config::Settings& settings);
 
+// Simulation / Sensor Injection Engine
+void setInjectedData(const SensorData& data);
+bool isInjectionActive();
+
 }  // namespace Sensors

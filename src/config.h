@@ -8,7 +8,7 @@
 namespace Config {
 
 constexpr uint32_t CONFIG_MAGIC = 0x41555631;  // 'AUV1'
-constexpr uint8_t CONFIG_VERSION = 1;
+constexpr uint8_t CONFIG_VERSION = 4;
 constexpr size_t THRUSTER_COUNT = 6;
 constexpr size_t AXIS_COUNT = 6;  // Surge, Sway, Heave, Yaw, Pitch, Roll
 
@@ -23,8 +23,8 @@ constexpr uint16_t DEFAULT_PULSE_MIN_US = 1000;
 constexpr uint16_t DEFAULT_PULSE_NEUTRAL_US = 1500;
 constexpr uint16_t DEFAULT_PULSE_MAX_US = 2000;
 
-// Default Direction Polarity: T5 & T6 vertical thrusters inverted for CW/CCW blade balance
-constexpr uint8_t DEFAULT_THRUSTER_REVERSE[THRUSTER_COUNT] = {0, 0, 0, 0, 1, 1};
+// Direction Polarity: T1, T2 (CW) = 1; T3, T4 (CCW) = 0; T5 (CCW) = 1; T6 (CW) = 0
+constexpr uint8_t DEFAULT_THRUSTER_REVERSE[THRUSTER_COUNT] = {1, 1, 0, 0, 1, 0};
 constexpr float DEFAULT_THRUSTER_TRIM[THRUSTER_COUNT] = {1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f};
 
 // Safety Limits
@@ -36,16 +36,16 @@ constexpr uint8_t MPU6050_ADDR_SECONDARY = 0x69;
 constexpr uint8_t MS5803_ADDR_HIGH = 0x76;
 constexpr uint8_t MS5803_ADDR_LOW = 0x77;
 
-// Default PID Parameters
-constexpr float DEFAULT_PID_DEPTH_KP = 0.040f;
+// Default PID Parameters (Responsive gains to break ESC deadband)
+constexpr float DEFAULT_PID_DEPTH_KP = 0.60f;
 constexpr float DEFAULT_PID_DEPTH_KI = 0.000f;
 constexpr float DEFAULT_PID_DEPTH_KD = 0.015f;
 
-constexpr float DEFAULT_PID_ROLL_KP = 0.020f;
+constexpr float DEFAULT_PID_ROLL_KP = 0.80f;
 constexpr float DEFAULT_PID_ROLL_KI = 0.000f;
 constexpr float DEFAULT_PID_ROLL_KD = 0.008f;
 
-constexpr float DEFAULT_PID_PITCH_KP = 0.020f;
+constexpr float DEFAULT_PID_PITCH_KP = 0.80f;
 constexpr float DEFAULT_PID_PITCH_KI = 0.000f;
 constexpr float DEFAULT_PID_PITCH_KD = 0.008f;
 
@@ -95,6 +95,10 @@ struct Settings {
   uint8_t depthZeroCalibrated;
   float waterDensity;  // kg/m3
 
+  // Auto-Run Configuration
+  uint8_t autoRunEnabled;   // 0 = disabled, 1 = enabled on boot
+  uint8_t autoRunDelaySec;  // Countdown delay (3 to 60 seconds, default 10)
+
   uint32_t checksum;
 };
 
@@ -139,6 +143,9 @@ inline void loadDefaults(Settings& s) {
   s.depthZeroCalibrated = 0;
   s.waterDensity = 1000.0f;
 
+  s.autoRunEnabled = 0;
+  s.autoRunDelaySec = 10;
+
   s.checksum = calculateChecksum(s);
 }
 
@@ -153,6 +160,12 @@ inline bool loadSettings(Settings& s) {
     }
     if (s.waterDensity < 800.0f || s.waterDensity > 1200.0f) {
       s.waterDensity = 1000.0f;
+    }
+    if (s.autoRunDelaySec < 3 || s.autoRunDelaySec > 60) {
+      s.autoRunDelaySec = 10;
+    }
+    if (s.autoRunEnabled > 1) {
+      s.autoRunEnabled = 0;
     }
     for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
       if (s.thrusters[i].pulseMin < 800 || s.thrusters[i].pulseMin > 1400) {
