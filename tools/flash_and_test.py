@@ -6,9 +6,11 @@ import string
 import serial
 import serial.tools.list_ports
 
-COM_PORT = 'COM4'
+COM_PORT = os.environ.get('AUV_COM_PORT', 'COM4')
 BAUD_RATE = 115200
-UF2_SRC = r'D:\Projcet\Source Code SAUVC\auv-6thruster-rev-0.1\firmware\firmware_rev0.1.uf2'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+UF2_SRC = os.path.join(PROJECT_ROOT, 'firmware', 'firmware_rev0.1.uf2')
 
 print("=== STEP 1: Flashing RP2040 on COM4 ===")
 if not os.path.exists(UF2_SRC):

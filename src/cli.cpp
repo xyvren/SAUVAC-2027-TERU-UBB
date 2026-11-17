@@ -28,7 +28,18 @@ constexpr const char* ANSI_BOLD_WHITE  = "\033[1;37m";
 MotorControlInterface iface{};
 bool initialized = false;
 
-String inputBuffer = "";
+// Dual-Channel Serial Isolation Buffers
+char machineBuffer[128];
+size_t machineLen = 0;
+bool inMachinePacket = false;
+bool machinePacketJustFinished = false;
+
+char cliBuffer[128];
+size_t cliLen = 0;
+
+bool telemStreamActive = false;
+uint8_t telemStreamHz = 10;
+
 bool sensorStreamActive = false;
 uint32_t lastSensorStreamAt = 0;
 uint32_t streamStartedAt = 0;
@@ -100,7 +111,9 @@ void printHelp() {
   Serial.print(ANSI_RESET);
   Serial.println(F("  help, ?                    : Display this command reference"));
   Serial.println(F("  status, stat               : Live dashboard (IMU tilt, depth, arm state, limit)"));
-  Serial.println(F("  sensor [stream|off]        : One-shot snapshot or live 5Hz continuous telemetry"));
+  Serial.println(F("  sensor [stream|off]        : One-shot snapshot or live 5Hz human telemetry"));
+  Serial.println(F("  telem [on|off|<hz>]        : $TEL streaming engine (default: 10 Hz)"));
+  Serial.println(F("  $POLL or $GET              : Immediate single $TEL telemetry packet reply"));
   Serial.println(F("  stop                       : EMERGENCY STOP: Neutralize all motors immediately"));
 
   Serial.print(ANSI_BOLD_YELLOW);
@@ -109,6 +122,7 @@ void printHelp() {
   Serial.println(F("  run [now]                  : Start autonomous mission (with countdown or 'now')"));
   Serial.println(F("  autorun <on|off>           : Enable/disable auto-run countdown on Pico W boot"));
   Serial.println(F("  autorun delay <3-60>       : Set boot launch countdown delay in seconds (default: 10)"));
+  Serial.println(F("  autorun timing <d> <t> <l> : Set delay, surface tare (T-ts), and level (T-ls) timing"));
   Serial.println(F("  autorun status             : View auto-run configuration and calibration status"));
   Serial.println(F("  jalur, mission             : Display ASCII table of loaded mission steps"));
   Serial.println(F("  jalur default              : Restore default sample trajectory to /jalur.json"));
@@ -120,6 +134,10 @@ void printHelp() {
   Serial.println(F("  thrusters, motor           : Table of all 6 thrusters (pins, pulses, reverse, trim)"));
   Serial.println(F("  limit <1-100>              : Set global safety power limit (default: 25%)"));
   Serial.println(F("  tes <id 1-6|all> <power>   : Test motor(s) for 2.0s (-limit to +limit %)"));
+  Serial.println(F("  esc deadband <0-80>        : Set ESC deadband in microseconds (default: 25us)"));
+  Serial.println(F("  esc calib [start|max|min]  : Interactive bench ESC throttle range calibration"));
+  Serial.println(F("  motor balance horiz <pct>  : Differential horizontal trim Port vs Stbd (-20 to +20%)"));
+  Serial.println(F("  motor balance vert <pct>   : Differential vertical trim T5 vs T6 (-20 to +20%)"));
   Serial.println(F("  thruster <id> <prop> <val> : Fine-tune motor parameters:"));
   Serial.println(F("                               prop: min (800-1400us), max (1600-2200us)"));
   Serial.println(F("                                     neutral (1400-1600us), reverse (0|1)"));
@@ -199,7 +217,7 @@ void printStatus() {
                 static_cast<unsigned>(Mission::getStepCount()),
                 Mission::getTotalDurationSec());
 
-  // Power Limit
+  // Power Limit & Actuator Trims
   Serial.print(F("Safety Cap       : "));
   Serial.print(ANSI_BOLD_CYAN);
   Serial.print(iface.settings->powerLimitPercent);
@@ -213,6 +231,11 @@ void printStatus() {
     Serial.println(F(" (WARNING: ELEVATED LIMIT)"));
   }
   Serial.print(ANSI_RESET);
+
+  Serial.printf("ESC Deadband     : %u us | Balance Trim: Horiz=%+.1f%% (Port/Stbd), Vert=%+.1f%% (T5/T6)\r\n",
+                iface.settings->escDeadbandUs,
+                iface.settings->diffHorizTrim,
+                iface.settings->diffVertTrim);
 
   Serial.println(F("-------------------------------------------------------------------------------"));
   if (Sensors::isInjectionActive()) {
@@ -331,9 +354,13 @@ void printThrusterTable() {
                   fmtFloat(t.trim, 2, 4).c_str());
   }
   Serial.println(F("+----+------+----------+--------------+----------+---------+--------------------+"));
-  Serial.printf("Global Safety Power Limit: %u%% | Cap Status: %s\r\n\r\n",
+  Serial.printf("Global Safety Power Limit: %u%% | Cap Status: %s\r\n",
                 iface.settings->powerLimitPercent,
                 iface.settings->powerLimitPercent <= 25 ? "ACTIVE (Safe 25% Cap)" : "OVERRIDDEN (>25%)");
+  Serial.printf("ESC Deadband: %u us | Balance: Horiz (Port/Stbd) = %+.1f%%, Vert (T5/T6) = %+.1f%%\r\n\r\n",
+                iface.settings->escDeadbandUs,
+                iface.settings->diffHorizTrim,
+                iface.settings->diffVertTrim);
 }
 
 void printSensorSnapshot() {
@@ -400,7 +427,109 @@ void handleCommand(const String& rawCmd) {
     return;
   }
 
-  // 4. THRUSTERS / MOTOR
+  // 3b. TELEM / TELEMETRY ($TEL Streaming Engine)
+  if (root == "telem" || root == "telemetry") {
+    if (tokenCount < 2) {
+      Serial.printf("Telemetry stream: %s at %u Hz.\r\n", telemStreamActive ? "ACTIVE" : "INACTIVE", telemStreamHz);
+      Serial.println(F("Usage: telem on | telem off | telem <hz 1-50> | $POLL"));
+      return;
+    }
+    String sub = tokens[1];
+    sub.toLowerCase();
+    if (sub == "on" || sub == "1" || sub == "enable") {
+      setTelemActive(true, telemStreamHz);
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Telemetry stream ENABLED at %u Hz ($TEL packets streaming).\r\n", telemStreamHz);
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "off" || sub == "0" || sub == "disable") {
+      setTelemActive(false);
+      Serial.print(ANSI_YELLOW);
+      Serial.println(F("OK: Telemetry stream DISABLED."));
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "status") {
+      Serial.printf("Telemetry stream: %s at %u Hz.\r\n", telemStreamActive ? "ACTIVE" : "INACTIVE", telemStreamHz);
+      return;
+    } else {
+      int hz = sub.toInt();
+      if (hz >= 1 && hz <= 50) {
+        setTelemActive(true, static_cast<uint8_t>(hz));
+        Serial.print(ANSI_GREEN);
+        Serial.printf("OK: Telemetry stream set to %d Hz and ENABLED ($TEL streaming).\r\n", hz);
+        Serial.print(ANSI_RESET);
+        return;
+      } else {
+        Serial.println(F("ERROR: Usage: telem on | telem off | telem <hz 1-50>"));
+        return;
+      }
+    }
+  }
+
+  // 3c. POLL / GET (One-shot telemetry query fallback)
+  if (root == "poll" || root == "get") {
+    sendTelemPacket();
+    return;
+  }
+
+  // 4. THRUSTERS / MOTOR / BALANCE
+  if (root == "balance" || ((root == "thrusters" || root == "motor" || root == "motors") &&
+                            tokenCount > 1 && tokens[1].equalsIgnoreCase("balance"))) {
+    size_t subIdx = (root == "balance") ? 1 : 2;
+    if (tokenCount <= subIdx) {
+      Serial.println();
+      Serial.print(ANSI_BOLD_CYAN);
+      Serial.println(F("╔═════════════════════════════════════════════════════════════════════════════╗"));
+      Serial.println(F("║                   DIFFERENTIAL THRUSTER BALANCE TRIMS                       ║"));
+      Serial.println(F("╚═════════════════════════════════════════════════════════════════════════════╝"));
+      Serial.print(ANSI_RESET);
+      Serial.printf("Horizontal Balance : %+.1f%% (Port T1/T3 vs Starboard T2/T4)\r\n", iface.settings->diffHorizTrim);
+      Serial.printf("Vertical Balance   : %+.1f%% (T5 vs T6)\r\n", iface.settings->diffVertTrim);
+      Serial.println(F("Usage: motor balance horiz <-20 to +20%> | motor balance vert <-20 to +20%>"));
+      return;
+    }
+
+    String axis = tokens[subIdx];
+    axis.toLowerCase();
+    if (tokenCount <= subIdx + 1) {
+      if (axis == "horiz" || axis == "horizontal") {
+        Serial.printf("Horizontal Balance: %+.1f%% (Port T1/T3 vs Stbd T2/T4)\r\n", iface.settings->diffHorizTrim);
+      } else if (axis == "vert" || axis == "vertical") {
+        Serial.printf("Vertical Balance: %+.1f%% (T5 vs T6)\r\n", iface.settings->diffVertTrim);
+      } else {
+        Serial.println(F("Usage: motor balance horiz <pct> | motor balance vert <pct>"));
+      }
+      return;
+    }
+
+    float val = tokens[subIdx + 1].toFloat();
+    if (val < -20.0f || val > 20.0f) {
+      Serial.print(ANSI_RED);
+      Serial.println(F("ERROR: Differential balance trim must be between -20.0% and +20.0%."));
+      Serial.print(ANSI_RESET);
+      return;
+    }
+
+    if (axis == "horiz" || axis == "horizontal") {
+      iface.settings->diffHorizTrim = val;
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Differential horizontal trim set to %+.1f%% (Port T1/T3 vs Starboard T2/T4).\r\n", val);
+      Serial.print(ANSI_RESET);
+      Serial.println(F("Type 'save' to commit to EEPROM."));
+      return;
+    } else if (axis == "vert" || axis == "vertical") {
+      iface.settings->diffVertTrim = val;
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Differential vertical trim set to %+.1f%% (T5 vs T6).\r\n", val);
+      Serial.print(ANSI_RESET);
+      Serial.println(F("Type 'save' to commit to EEPROM."));
+      return;
+    } else {
+      Serial.printf("ERROR: Unknown balance axis '%s'. Use 'horiz' or 'vert'.\r\n", axis.c_str());
+      return;
+    }
+  }
+
   if (root == "thrusters" || root == "motor" || root == "motors") {
     printThrusterTable();
     return;
@@ -445,8 +574,28 @@ void handleCommand(const String& rawCmd) {
     }
 
     uint8_t id = 0;
-    if (tokens[1].equalsIgnoreCase("all")) {
-      id = 0;  // 0 signifies all motors
+    size_t pwrIdx = 2;
+    if (tokens[1].equalsIgnoreCase("motor")) {
+      if (tokenCount < 4) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: Usage: tes motor <id 1-6|all> <power percent>"));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      if (tokens[2].equalsIgnoreCase("all")) {
+        id = 0;
+      } else {
+        id = static_cast<uint8_t>(tokens[2].toInt());
+        if (id < 1 || id > Config::THRUSTER_COUNT) {
+          Serial.print(ANSI_RED);
+          Serial.println(F("ERROR: Motor ID must be 1 to 6 or 'all'."));
+          Serial.print(ANSI_RESET);
+          return;
+        }
+      }
+      pwrIdx = 3;
+    } else if (tokens[1].equalsIgnoreCase("all")) {
+      id = 0;
     } else {
       id = static_cast<uint8_t>(tokens[1].toInt());
       if (id < 1 || id > Config::THRUSTER_COUNT) {
@@ -457,7 +606,7 @@ void handleCommand(const String& rawCmd) {
       }
     }
 
-    String powerStr = tokens[2];
+    String powerStr = tokens[pwrIdx];
     if (powerStr.endsWith("%")) {
       powerStr = powerStr.substring(0, powerStr.length() - 1);
     }
@@ -552,6 +701,78 @@ void handleCommand(const String& rawCmd) {
     Serial.printf("OK: Thruster T%d %s set to %s. Type 'save' to commit to EEPROM.\r\n", id, prop.c_str(), valStr.c_str());
     Serial.print(ANSI_RESET);
     return;
+  }
+
+  // 7b. ESC DEADBAND / ESC CALIB
+  if (root == "esc") {
+    if (tokenCount < 2) {
+      Serial.println(F("Usage: esc deadband <0-80 us> | esc calib [start|confirm|max|min|neutral]"));
+      Serial.printf("Current ESC Deadband: %u us\r\n", iface.settings->escDeadbandUs);
+      return;
+    }
+    String sub = tokens[1];
+    sub.toLowerCase();
+    if (sub == "deadband") {
+      if (tokenCount < 3) {
+        Serial.printf("Current ESC deadband: %u us (allowed: 0-80 us)\r\n", iface.settings->escDeadbandUs);
+        return;
+      }
+      int db = tokens[2].toInt();
+      if (db < 0 || db > 80) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: ESC deadband must be between 0 and 80 microseconds."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      iface.settings->escDeadbandUs = static_cast<uint16_t>(db);
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: ESC deadband set to %u us. Type 'save' to commit to EEPROM.\r\n", db);
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "calib") {
+      if (tokenCount < 3) {
+        Serial.println();
+        Serial.print(ANSI_BOLD_RED);
+        Serial.println(F("╔═════════════════════════════════════════════════════════════════════════════╗"));
+        Serial.println(F("║              DANGER: ESC THROTTLE CALIBRATION ROUTINE                       ║"));
+        Serial.println(F("║        ENSURE ALL PROPELLERS ARE REMOVED BEFORE PROCEEDING!                 ║"));
+        Serial.println(F("╚═════════════════════════════════════════════════════════════════════════════╝"));
+        Serial.print(ANSI_RESET);
+        Serial.println(F("Sequence: MAX (2000us, 3s) -> MIN (1000us, 3s) -> NEUTRAL (1500us)."));
+        Serial.println(F("Type 'esc calib confirm' or 'esc calib start' to begin automated calibration."));
+        Serial.println(F("Or manual steps: 'esc calib max', 'esc calib min', 'esc calib neutral'."));
+        Serial.println(F("Type 'stop' at any time to abort."));
+        return;
+      }
+      String action = tokens[2];
+      action.toLowerCase();
+      if (action == "start" || action == "confirm" || action == "run" || action == "y") {
+        if (iface.startEscCalib) {
+          iface.startEscCalib();
+        } else {
+          Serial.println(F("ERROR: ESC calibration routine not attached."));
+        }
+        return;
+      } else if (action == "max") {
+        if (iface.setRawPulseAll) iface.setRawPulseAll(2000);
+        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MAX (2000us)."));
+        return;
+      } else if (action == "min") {
+        if (iface.setRawPulseAll) iface.setRawPulseAll(1000);
+        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MIN (1000us)."));
+        return;
+      } else if (action == "neutral" || action == "stop") {
+        if (iface.setRawPulseAll) iface.setRawPulseAll(1500);
+        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to NEUTRAL (1500us)."));
+        return;
+      } else {
+        Serial.printf("ERROR: Unknown esc calib option '%s'. Use 'start', 'max', 'min', or 'neutral'.\r\n", action.c_str());
+        return;
+      }
+    } else {
+      Serial.printf("ERROR: Unknown esc command '%s'. Use 'esc deadband <0-80>' or 'esc calib'.\r\n", sub.c_str());
+      return;
+    }
   }
 
   // 8. CALIB ZERO / LEVEL
@@ -730,8 +951,8 @@ void handleCommand(const String& rawCmd) {
       Serial.print(ANSI_RESET);
 
       Serial.printf("Countdown Delay  : %u seconds (range: 3-60s)\r\n", iface.settings->autoRunDelaySec);
-      Serial.println(F("Surface Tare     : Automatic at T-3s (MS5803 depth zero calibration)"));
-      Serial.println(F("IMU Leveling     : Automatic at T-2s (MPU-6050 Pitch/Roll zero calibration)"));
+      Serial.printf("Surface Tare     : Automatic at T-%us (MS5803 depth zero calibration)\r\n", iface.settings->autoRunTareSec);
+      Serial.printf("IMU Leveling     : Automatic at T-%us (MPU-6050 Pitch/Roll zero calibration)\r\n", iface.settings->autoRunLevelSec);
       Serial.printf("Trajectory File  : /jalur.json (%u steps loaded, %.1f s duration)\r\n",
                     static_cast<unsigned>(Mission::getStepCount()),
                     Mission::getTotalDurationSec());
@@ -770,6 +991,44 @@ void handleCommand(const String& rawCmd) {
       iface.settings->autoRunDelaySec = static_cast<uint8_t>(sec);
       Serial.print(ANSI_GREEN);
       Serial.printf("OK: Countdown delay set to %d seconds. Type 'save' to commit to EEPROM.\r\n", sec);
+      Serial.print(ANSI_RESET);
+      return;
+    } else if (sub == "timing") {
+      if (tokenCount < 5) {
+        Serial.println(F("Usage: autorun timing <delaySec 3-60> <tareSec 1-delay> <levelSec 1-delay>"));
+        Serial.printf("Current timing: Delay=%u s, Tare=T-%u s, Level=T-%u s\r\n",
+                      iface.settings->autoRunDelaySec,
+                      iface.settings->autoRunTareSec,
+                      iface.settings->autoRunLevelSec);
+        return;
+      }
+      int d = tokens[2].toInt();
+      int t = tokens[3].toInt();
+      int l = tokens[4].toInt();
+      if (d < 3 || d > 60) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: Delay must be between 3 and 60 seconds."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      if (t < 1 || t > d) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: Tare seconds must be between 1 and total countdown delay."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      if (l < 1 || l > d) {
+        Serial.print(ANSI_RED);
+        Serial.println(F("ERROR: Level seconds must be between 1 and total countdown delay."));
+        Serial.print(ANSI_RESET);
+        return;
+      }
+      iface.settings->autoRunDelaySec = static_cast<uint8_t>(d);
+      iface.settings->autoRunTareSec = static_cast<uint8_t>(t);
+      iface.settings->autoRunLevelSec = static_cast<uint8_t>(l);
+      Serial.print(ANSI_GREEN);
+      Serial.printf("OK: Auto-run timing updated: Delay=%u s, Tare=T-%u s, Level=T-%u s. Type 'save' to commit to EEPROM.\r\n",
+                    d, t, l);
       Serial.print(ANSI_RESET);
       return;
     } else {
@@ -908,7 +1167,85 @@ void handleInjPacket(const String& packet) {
   Serial.print(actBuf);
 }
 
+void handleMachinePacket(const char* packet) {
+  if (strncmp(packet, "$INJ", 4) == 0) {
+    handleInjPacket(String(packet));
+    return;
+  }
+
+  if (strcmp(packet, "$POLL") == 0 || strcmp(packet, "$GET") == 0) {
+    sendTelemPacket();
+    return;
+  }
+
+  if (strncmp(packet, "$TEL", 4) == 0) {
+    const char* p = packet + 4;
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == '\0') {
+      sendTelemPacket();
+      return;
+    }
+    if (strcasecmp(p, "ON") == 0 || strcmp(p, "1") == 0) {
+      setTelemActive(true, telemStreamHz);
+      return;
+    }
+    if (strcasecmp(p, "OFF") == 0 || strcmp(p, "0") == 0) {
+      setTelemActive(false);
+      return;
+    }
+    int hz = atoi(p);
+    if (hz >= 1 && hz <= 50) {
+      setTelemActive(true, static_cast<uint8_t>(hz));
+      return;
+    }
+  }
+}
+
 }  // namespace
+
+void sendTelemPacket() {
+  Sensors::SensorData s{};
+  Sensors::snapshot(s);
+
+  uint16_t t1 = iface.getCurrentPulse ? iface.getCurrentPulse(0) : 1500;
+  uint16_t t2 = iface.getCurrentPulse ? iface.getCurrentPulse(1) : 1500;
+  uint16_t t3 = iface.getCurrentPulse ? iface.getCurrentPulse(2) : 1500;
+  uint16_t t4 = iface.getCurrentPulse ? iface.getCurrentPulse(3) : 1500;
+  uint16_t t5 = iface.getCurrentPulse ? iface.getCurrentPulse(4) : 1500;
+  uint16_t t6 = iface.getCurrentPulse ? iface.getCurrentPulse(5) : 1500;
+  int isArmed = (iface.armed && *iface.armed) ? 1 : 0;
+  int fsmStateNum = iface.getFsmState ? static_cast<int>(iface.getFsmState()) : 0;
+
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "$TEL,%s,%s,%s,%s,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%d,%d\r\n",
+           fmtFloat(s.depthCm, 1).c_str(),
+           fmtFloat(s.pressureMbar, 1).c_str(),
+           fmtFloat(s.pitch, 1).c_str(),
+           fmtFloat(s.roll, 1).c_str(),
+           fmtFloat(s.temperatureC, 1).c_str(),
+           fmtFloat(s.gyroDps[0], 1).c_str(),
+           fmtFloat(s.gyroDps[1], 1).c_str(),
+           fmtFloat(s.gyroDps[2], 1).c_str(),
+           t1, t2, t3, t4, t5, t6,
+           isArmed, fsmStateNum);
+  Serial.print(buf);
+}
+
+bool isTelemActive() {
+  return telemStreamActive;
+}
+
+uint8_t getTelemRateHz() {
+  return telemStreamHz;
+}
+
+void setTelemActive(bool active, uint8_t rateHz) {
+  telemStreamActive = active;
+  if (rateHz >= 1 && rateHz <= 50) {
+    telemStreamHz = rateHz;
+  }
+}
 
 void begin(const MotorControlInterface& controlInterface) {
   iface = controlInterface;
@@ -978,17 +1315,52 @@ void update() {
     return;
   }
 
-  // Check for incoming serial characters
+  // Check for incoming serial characters (Dual-Channel Isolation)
   while (Serial.available()) {
     char c = static_cast<char>(Serial.read());
 
-    // If streaming sensor data, any key stops the stream
+    // 1. If '$' is received, switch unconditionally to private machine buffer
+    if (c == '$') {
+      inMachinePacket = true;
+      machineLen = 0;
+      machineBuffer[machineLen++] = c;
+      machineBuffer[machineLen] = '\0';
+      continue;
+    }
+
+    // 2. Machine Packet Channel (NO echo, isolated from CLI buffer)
+    if (inMachinePacket) {
+      if (c == '\r' || c == '\n') {
+        inMachinePacket = false;
+        if (machineLen > 0) {
+          machineBuffer[machineLen] = '\0';
+          handleMachinePacket(machineBuffer);
+          machineLen = 0;
+          machineBuffer[0] = '\0';
+          machinePacketJustFinished = true;
+        }
+      } else {
+        if (machineLen < sizeof(machineBuffer) - 1) {
+          machineBuffer[machineLen++] = c;
+          machineBuffer[machineLen] = '\0';
+        }
+      }
+      continue;
+    }
+
+    // Discard trailing '\n' if immediately following machine packet ending in '\r'
+    if (machinePacketJustFinished) {
+      machinePacketJustFinished = false;
+      if (c == '\n') {
+        continue;
+      }
+    }
+
+    // 3. Sensor Stream abort on user keypress
     if (sensorStreamActive) {
-      // Discard leftover CRLF from the Enter keypress during the first 350 ms
       if (millis() - streamStartedAt < 350) {
         continue;
       }
-      // Ignore lone newline or carriage return if they arrive
       if (c == '\r' || c == '\n') {
         continue;
       }
@@ -998,44 +1370,57 @@ void update() {
       continue;
     }
 
+    // 4. Human CLI Channel (buffered into cliBuffer with backspace and echo)
     if (c == '\r' || c == '\n') {
-      if (inputBuffer.length() > 0) {
-        if (inputBuffer.startsWith("$INJ")) {
-          handleInjPacket(inputBuffer);
-          inputBuffer = "";
-          continue;
-        }
-
+      if (cliLen > 0) {
+        cliBuffer[cliLen] = '\0';
         Serial.println();
+        String cmd = String(cliBuffer);
+        cliLen = 0;
+        cliBuffer[0] = '\0';
 
-        // Check if countdown is active: any command or 'stop' aborts countdown immediately!
+        // Check if countdown is active: only explicit interrupts abort countdown!
         if (iface.isCountdownActive && iface.isCountdownActive()) {
-          if (iface.cancelMission) iface.cancelMission();
-          Serial.println(F("[AUTORUN] Countdown ABORTED by operator. System returned to IDLE mode."));
-          String cmd = inputBuffer;
-          inputBuffer = "";
-          if (!cmd.equalsIgnoreCase("stop") && !cmd.equalsIgnoreCase("abort") && !cmd.equalsIgnoreCase("disarm")) {
-            handleCommand(cmd);
+          String testCmd = cmd;
+          testCmd.trim();
+          if (testCmd.startsWith("/")) testCmd = testCmd.substring(1);
+          testCmd.toLowerCase();
+
+          bool isPassive = (testCmd == "status" || testCmd == "stat" ||
+                            testCmd == "help" || testCmd == "?" ||
+                            testCmd == "thrusters" || testCmd == "motor" || testCmd == "motors" ||
+                            testCmd == "sensor" || testCmd.startsWith("autorun status") ||
+                            testCmd.startsWith("jalur") || testCmd.startsWith("mission") ||
+                            testCmd.startsWith("telem"));
+          if (!isPassive) {
+            if (iface.cancelMission) iface.cancelMission();
+            Serial.println(F("[AUTORUN] Countdown ABORTED by operator. System returned to IDLE mode."));
+            if (testCmd != "stop" && testCmd != "abort" && testCmd != "disarm") {
+              handleCommand(cmd);
+            }
+            printPrompt();
+            return;
           }
-          printPrompt();
-          return;
         }
 
-        handleCommand(inputBuffer);
-        inputBuffer = "";
+        handleCommand(cmd);
+        printPrompt();
+      } else {
+        // Empty enter pressed
+        Serial.println();
         printPrompt();
       }
     } else if (c == '\b' || c == 0x7F) {
-      if (inputBuffer.length() > 0) {
-        inputBuffer.remove(inputBuffer.length() - 1);
-        if (!inputBuffer.startsWith("$")) {
-          Serial.print(F("\b \b"));  // Visual backspace
-        }
+      if (cliLen > 0) {
+        cliLen--;
+        cliBuffer[cliLen] = '\0';
+        Serial.print(F("\b \b"));  // Visual backspace
       }
     } else if (c >= 32 && c <= 126) {
-      inputBuffer += c;
-      if (!inputBuffer.startsWith("$")) {
-        Serial.print(c);  // Echo character
+      if (cliLen < sizeof(cliBuffer) - 1) {
+        cliBuffer[cliLen++] = c;
+        cliBuffer[cliLen] = '\0';
+        Serial.print(c);  // Terminal echo
       }
     }
   }

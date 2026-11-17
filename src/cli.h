@@ -30,6 +30,11 @@ struct MotorControlInterface {
   void (*onInjected)();
   void (*setTargetDepth)(float targetCm);
   float (*getTargetDepth)();
+
+  // Telemetry & Actuator hooks
+  uint8_t (*getFsmState)();
+  void (*startEscCalib)();
+  void (*setRawPulseAll)(uint16_t pulseUs);
 };
 
 void begin(const MotorControlInterface& iface);
@@ -40,5 +45,11 @@ void logInfo(const char* fmt, ...);
 void logWarn(const char* fmt, ...);
 void logError(const char* fmt, ...);
 void logState(const char* fmt, ...);
+
+// Telemetry stream control
+bool isTelemActive();
+uint8_t getTelemRateHz();
+void setTelemActive(bool active, uint8_t rateHz = 10);
+void sendTelemPacket();
 
 }  // namespace CLI

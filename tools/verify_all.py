@@ -1,7 +1,8 @@
+import os
 import time
 import serial
 
-COM_PORT = 'COM4'
+COM_PORT = os.environ.get('AUV_COM_PORT', 'COM4')
 BAUD = 115200
 
 ser = serial.Serial(COM_PORT, BAUD, timeout=1.0)

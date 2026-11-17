@@ -1,0 +1,74 @@
+[
+  {
+    "langkah": 1,
+    "nama": "Menyelam ke 50 cm",
+    "aksi": "DIVE",
+    "daya": 15.0,
+    "durasi_detik": 5.0,
+    "target_cm": 50.0,
+    "motors": [
+      5,
+      6
+    ]
+  },
+  {
+    "langkah": 2,
+    "nama": "Berenang Maju Lurus",
+    "aksi": "MAJU",
+    "daya": 20.0,
+    "durasi_detik": 12.0,
+    "target_cm": 50.0,
+    "motors": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ]
+  },
+  {
+    "langkah": 3,
+    "nama": "Putar Haluan Kanan",
+    "aksi": "PUTAR",
+    "daya": 15.0,
+    "durasi_detik": 4.0,
+    "target_cm": 50.0,
+    "motors": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ]
+  },
+  {
+    "langkah": 4,
+    "nama": "Berenang Kembali",
+    "aksi": "MAJU",
+    "daya": 20.0,
+    "durasi_detik": 12.0,
+    "target_cm": 50.0,
+    "motors": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ]
+  },
+  {
+    "langkah": 5,
+    "nama": "Naik ke Permukaan",
+    "aksi": "SURFACE",
+    "daya": 15.0,
+    "durasi_detik": 4.0,
+    "target_cm": 0.0,
+    "motors": [
+      5,
+      6
+    ]
+  }
+]

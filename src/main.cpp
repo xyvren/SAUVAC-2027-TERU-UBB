@@ -38,11 +38,21 @@ bool countdownImuDone = false;
 // Mission State
 size_t currentStepIndex = 0;
 uint32_t stepStartedAtMs = 0;
+static float activeLockedDepthCm = 0.0f;
 
 // Motor Test Engine State
 uint32_t testUntilMs = 0;
 uint8_t testMotorId = 0;  // 0 = all, 1..6 = specific motor
 uint16_t testMotorPulse[Config::THRUSTER_COUNT];
+
+// ESC Calibration State
+enum class EscCalibState {
+  IDLE,
+  MAX_THROTTLE,
+  MIN_THROTTLE
+};
+EscCalibState escCalibState = EscCalibState::IDLE;
+uint32_t escCalibPhaseStartMs = 0;
 
 // Control Loop Timing (50 Hz / 20 ms fixed tick)
 constexpr uint32_t OUTPUT_INTERVAL_MS = 20;
@@ -56,6 +66,7 @@ float previousDepthCm = 0.0f;
 float targetDepthCm = 0.0f;
 
 void stopAllThrusters() {
+  activeLockedDepthCm = 0.0f;
   for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
     if (thrusters[i].attached()) {
       thrusters[i].writeMicroseconds(settings.thrusters[i].pulseNeutral);
@@ -90,18 +101,40 @@ uint16_t calculateTargetPulse(size_t index, float powerPercent) {
   const float maxPwr = static_cast<float>(settings.powerLimitPercent);
   const float clampedPwr = constrain(powerPercent, -maxPwr, maxPwr);
 
+  // If power is virtually zero, return exact neutral pulse
+  if (fabsf(clampedPwr) < 0.01f) {
+    return t.pulseNeutral;
+  }
+
   float frac = clampedPwr / 100.0f;
   if (t.reverse) {
     frac = -frac;
   }
   frac *= t.trim;
 
-  // Signed Intermediate Math Pattern to avoid ARM float-to-unsigned saturation
+  if (fabsf(frac) < 0.0001f) {
+    return t.pulseNeutral;
+  }
+
+  // Deadband Jump Compensation:
+  // Step immediately past settings.escDeadbandUs so low power commands physically turn the motor
+  const uint16_t deadband = min(settings.escDeadbandUs, static_cast<uint16_t>(80));
+
   int32_t delta = 0;
-  if (frac >= 0.0f) {
-    delta = lroundf(frac * (t.pulseMax - t.pulseNeutral));
-  } else {
-    delta = lroundf(frac * (t.pulseNeutral - t.pulseMin));
+  if (frac > 0.0f) {
+    int32_t span = static_cast<int32_t>(t.pulseMax) - static_cast<int32_t>(t.pulseNeutral);
+    if (span > deadband) {
+      delta = static_cast<int32_t>(deadband) + lroundf(frac * (span - deadband));
+    } else {
+      delta = lroundf(frac * span);
+    }
+  } else if (frac < 0.0f) {
+    int32_t span = static_cast<int32_t>(t.pulseNeutral) - static_cast<int32_t>(t.pulseMin);
+    if (span > deadband) {
+      delta = -static_cast<int32_t>(deadband) + lroundf(frac * (span - deadband));
+    } else {
+      delta = lroundf(frac * span);
+    }
   }
 
   int32_t calcPulse = static_cast<int32_t>(t.pulseNeutral) + delta;
@@ -157,6 +190,7 @@ bool handleStartMotorTest(uint8_t id, float powerPercent, String& message) {
 void handleEmergencyStop() {
   testUntilMs = 0;
   testMotorId = 0;
+  escCalibState = EscCalibState::IDLE;
   pidEnabled = false;
   fsmState = FsmState::IDLE;
   armed = false;
@@ -191,12 +225,31 @@ bool handleStartMission(bool immediate) {
     depthIntegral = 0.0f;
 
     const auto* step = Mission::getStep(0);
-    CLI::logState("System ARMED. Starting Step 1/%u: %s [%s] Power: %.0f%% (Duration: %.1fs)",
-                  static_cast<unsigned>(Mission::getStepCount()),
-                  step->name,
-                  Mission::actionToString(step->action),
-                  step->power,
-                  step->durationSec);
+    if (step && step->targetCm > 0.0f) {
+      activeLockedDepthCm = step->targetCm;
+    } else {
+      activeLockedDepthCm = 0.0f;
+    }
+    char maskBuf[18];
+    Mission::maskToString(step->motorMask, maskBuf, sizeof(maskBuf));
+    if (activeLockedDepthCm > 0.0f) {
+      CLI::logState("System ARMED. Starting Step 1/%u: %s [%s] (%s) Power: %.0f%% (Duration: %.1fs) | Target: %.0f cm",
+                    static_cast<unsigned>(Mission::getStepCount()),
+                    step->name,
+                    Mission::actionToString(step->action),
+                    maskBuf,
+                    step->power,
+                    step->durationSec,
+                    activeLockedDepthCm);
+    } else {
+      CLI::logState("System ARMED. Starting Step 1/%u: %s [%s] (%s) Power: %.0f%% (Duration: %.1fs)",
+                    static_cast<unsigned>(Mission::getStepCount()),
+                    step->name,
+                    Mission::actionToString(step->action),
+                    maskBuf,
+                    step->power,
+                    step->durationSec);
+    }
   } else {
     // Start countdown
     fsmState = FsmState::COUNTDOWN;
@@ -270,7 +323,45 @@ void handleSetTargetDepth(float target) {
 }
 
 float handleGetTargetDepth() {
+  if (fsmState == FsmState::MISSION_RUNNING && activeLockedDepthCm > 0.0f) {
+    return activeLockedDepthCm;
+  }
   return targetDepthCm;
+}
+
+void updateThrusters(const float commandedAxes[Config::AXIS_COUNT]) {
+  const float safetyCap = static_cast<float>(settings.powerLimitPercent);
+
+  // Differential trim multipliers:
+  // settings.diffHorizTrim (-20.0 to +20.0%): Port (T1, T3) vs Starboard (T2, T4)
+  // settings.diffVertTrim (-20.0 to +20.0%): T5 vs T6
+  const float portMult = 1.0f + (settings.diffHorizTrim * 0.01f);
+  const float stbdMult = 1.0f - (settings.diffHorizTrim * 0.01f);
+  const float t5Mult   = 1.0f + (settings.diffVertTrim * 0.01f);
+  const float t6Mult   = 1.0f - (settings.diffVertTrim * 0.01f);
+
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    float netPercent = 0.0f;
+    for (size_t a = 0; a < Config::AXIS_COUNT; ++a) {
+      netPercent += Config::DEFAULT_MIXER[i][a] * commandedAxes[a];
+    }
+
+    // Apply differential trims
+    if (i == 0 || i == 2) {
+      netPercent *= portMult;  // T1 (Rear-Left), T3 (Front-Left)
+    } else if (i == 1 || i == 3) {
+      netPercent *= stbdMult;  // T2 (Front-Right), T4 (Rear-Right)
+    } else if (i == 4) {
+      netPercent *= t5Mult;    // T5 (Mid-Right Vert)
+    } else if (i == 5) {
+      netPercent *= t6Mult;    // T6 (Mid-Left Vert)
+    }
+
+    netPercent = constrain(netPercent, -safetyCap, safetyCap);
+    const uint16_t pulse = calculateTargetPulse(i, netPercent);
+    thrusters[i].writeMicroseconds(pulse);
+    currentPulse[i] = pulse;
+  }
 }
 
 void updatePidStabilization(float dt) {
@@ -321,18 +412,7 @@ void updatePidStabilization(float dt) {
       rollOutput    // Roll
   };
 
-  const float safetyCap = static_cast<float>(settings.powerLimitPercent);
-
-  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
-    float netPercent = 0.0f;
-    for (size_t a = 0; a < Config::AXIS_COUNT; ++a) {
-      netPercent += Config::DEFAULT_MIXER[i][a] * commandedAxes[a];
-    }
-    netPercent = constrain(netPercent, -safetyCap, safetyCap);
-    const uint16_t pulse = calculateTargetPulse(i, netPercent);
-    thrusters[i].writeMicroseconds(pulse);
-    currentPulse[i] = pulse;
-  }
+  updateThrusters(commandedAxes);
 }
 
 void handleOnInjected() {
@@ -374,6 +454,7 @@ void updateMissionStepExecution(float dt, uint32_t now) {
     currentStepIndex++;
     if (currentStepIndex >= Mission::getStepCount()) {
       fsmState = FsmState::MISSION_DONE;
+      activeLockedDepthCm = 0.0f;
       stopAllThrusters();
       armed = false;
       Serial.println();
@@ -389,13 +470,28 @@ void updateMissionStepExecution(float dt, uint32_t now) {
 
     stepStartedAtMs = now;
     step = Mission::getStep(currentStepIndex);
-    Serial.printf("[MISSION] Starting Step %u/%u: %s | Action: %s | Power: %.0f%% | Duration: %.1fs\r\n",
+    if (step && step->targetCm > 0.0f) {
+      activeLockedDepthCm = step->targetCm;
+    }
+    char maskBuf[18];
+    Mission::maskToString(step->motorMask, maskBuf, sizeof(maskBuf));
+    Serial.printf("[MISSION] Starting Step %u/%u: %s | Action: %s (%s) | Power: %.0f%% | Duration: %.1fs",
                   static_cast<unsigned>(currentStepIndex + 1),
                   static_cast<unsigned>(Mission::getStepCount()),
                   step->name,
                   Mission::actionToString(step->action),
+                  maskBuf,
                   step->power,
                   step->durationSec);
+    if (activeLockedDepthCm > 0.0f) {
+      Serial.printf(" | Target: %.0f cm\r\n", activeLockedDepthCm);
+    } else {
+      Serial.println();
+    }
+  }
+
+  if (step && step->targetCm > 0.0f) {
+    activeLockedDepthCm = step->targetCm;
   }
 
   Sensors::SensorData sensor{};
@@ -429,7 +525,7 @@ void updateMissionStepExecution(float dt, uint32_t now) {
 
   // Helper for closed-loop depth hold
   auto calculateDepthHoldHeave = [&](float targetDepth) -> float {
-    if (sensor.pressureReady && settings.depthZeroCalibrated && targetDepth > 0.0f) {
+    if (((sensor.pressureReady && settings.depthZeroCalibrated) || Sensors::isInjectionActive()) && targetDepth > 0.0f) {
       const float depthError = targetDepth - sensor.depthCm;
       depthIntegral = constrain(depthIntegral + depthError * dt, -50.0f, 50.0f);
       const float depthRate = (dt > 0.001f) ? (sensor.depthCm - previousDepthCm) / dt : 0.0f;
@@ -437,15 +533,18 @@ void updateMissionStepExecution(float dt, uint32_t now) {
       const float dOut = settings.pidDepth.kp * depthError +
                          settings.pidDepth.ki * depthIntegral -
                          settings.pidDepth.kd * depthRate;
-      return constrain(dOut, -stepPower, stepPower);
+      return constrain(dOut, -safetyCap, safetyCap);
     }
     return 0.0f;
   };
 
   switch (step->action) {
     case Mission::Action::DIVE:
-      if (step->targetCm > 0.0f && sensor.pressureReady && settings.depthZeroCalibrated) {
-        heave = calculateDepthHoldHeave(step->targetCm);
+      if (step->targetCm > 0.0f) {
+        activeLockedDepthCm = step->targetCm;
+        heave = calculateDepthHoldHeave(activeLockedDepthCm);
+      } else if (activeLockedDepthCm > 0.0f) {
+        heave = calculateDepthHoldHeave(activeLockedDepthCm);
       } else {
         heave = stepPower;  // Constant downward thrust
       }
@@ -453,36 +552,66 @@ void updateMissionStepExecution(float dt, uint32_t now) {
 
     case Mission::Action::FORWARD:
       surge = stepPower;
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::BACKWARD:
       surge = -stepPower;
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::TURN:
       yaw = stepPower;
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::SWAY_LEFT:
       sway = -stepPower;
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::SWAY_RIGHT:
       sway = stepPower;
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::HOVER:
-      if (step->targetCm > 0.0f) heave = calculateDepthHoldHeave(step->targetCm);
+      if (activeLockedDepthCm > 0.0f) heave = calculateDepthHoldHeave(activeLockedDepthCm);
       break;
 
     case Mission::Action::SURFACE:
+      activeLockedDepthCm = 0.0f;
       heave = -stepPower;  // Upward push
       break;
+
+    case Mission::Action::MOTOR_1:
+    case Mission::Action::MOTOR_2:
+    case Mission::Action::MOTOR_3:
+    case Mission::Action::MOTOR_4:
+    case Mission::Action::MOTOR_5:
+    case Mission::Action::MOTOR_6:
+    case Mission::Action::ALL_MOTORS: {
+      uint8_t mask = step->motorMask;
+      if (mask == 0) {
+        if (step->action == Mission::Action::ALL_MOTORS) {
+          mask = 0x3F;
+        } else {
+          mask = (1 << (static_cast<int>(step->action) - static_cast<int>(Mission::Action::MOTOR_1)));
+        }
+      }
+      for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+        if (mask & (1 << i)) {
+          const uint16_t pulse = calculateTargetPulse(i, stepPower);
+          thrusters[i].writeMicroseconds(pulse);
+          currentPulse[i] = pulse;
+        } else {
+          const uint16_t neutral = settings.thrusters[i].pulseNeutral;
+          thrusters[i].writeMicroseconds(neutral);
+          currentPulse[i] = neutral;
+        }
+      }
+      return;  // Direct individual thruster execution completed
+    }
 
     default:
       break;
@@ -493,15 +622,165 @@ void updateMissionStepExecution(float dt, uint32_t now) {
       surge, sway, heave, yaw, pitchOutput, rollOutput
   };
 
-  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
-    float netPercent = 0.0f;
-    for (size_t a = 0; a < Config::AXIS_COUNT; ++a) {
-      netPercent += Config::DEFAULT_MIXER[i][a] * commandedAxes[a];
+  updateThrusters(commandedAxes);
+
+  // Apply step motorMask filter if specified (disable any thruster not set in mask)
+  if (step->motorMask != 0 && step->motorMask != 0x3F) {
+    for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+      if (!(step->motorMask & (1 << i))) {
+        const uint16_t neutral = settings.thrusters[i].pulseNeutral;
+        thrusters[i].writeMicroseconds(neutral);
+        currentPulse[i] = neutral;
+      }
     }
-    netPercent = constrain(netPercent, -safetyCap, safetyCap);
-    const uint16_t pulse = calculateTargetPulse(i, netPercent);
-    thrusters[i].writeMicroseconds(pulse);
-    currentPulse[i] = pulse;
+  }
+}
+
+uint8_t handleGetFsmState() {
+  return static_cast<uint8_t>(fsmState);
+}
+
+void handleStartEscCalib() {
+  if (!outputsReady) {
+    CLI::logError("ESC Calibration: Outputs not ready!");
+    return;
+  }
+  escCalibState = EscCalibState::MAX_THROTTLE;
+  escCalibPhaseStartMs = millis();
+  armed = true;
+  thrustersNeutral = false;
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    thrusters[i].writeMicroseconds(2000);
+    currentPulse[i] = 2000;
+  }
+  Serial.println();
+  Serial.println(F("[ESC CALIB] Phase 1/3: Outputting MAX throttle (2000us) to all 6 ESCs."));
+  Serial.println(F("[ESC CALIB] Waiting 3.0s for high-throttle confirmation beeps..."));
+}
+
+void handleSetRawPulseAll(uint16_t pulseUs) {
+  if (!outputsReady) return;
+  armed = (pulseUs != 1500);
+  thrustersNeutral = (pulseUs == 1500);
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    thrusters[i].writeMicroseconds(pulseUs);
+    currentPulse[i] = pulseUs;
+  }
+}
+
+void updateEscCalib(uint32_t now) {
+  if (escCalibState == EscCalibState::MAX_THROTTLE) {
+    for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+      thrusters[i].writeMicroseconds(2000);
+      currentPulse[i] = 2000;
+    }
+    if (now - escCalibPhaseStartMs >= 3000) {
+      escCalibState = EscCalibState::MIN_THROTTLE;
+      escCalibPhaseStartMs = now;
+      for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+        thrusters[i].writeMicroseconds(1000);
+        currentPulse[i] = 1000;
+      }
+      Serial.println();
+      Serial.println(F("[ESC CALIB] Phase 2/3: Outputting MIN throttle (1000us) to all 6 ESCs."));
+      Serial.println(F("[ESC CALIB] Waiting 3.0s for low-throttle confirmation beeps..."));
+    }
+    return;
+  }
+  if (escCalibState == EscCalibState::MIN_THROTTLE) {
+    for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+      thrusters[i].writeMicroseconds(1000);
+      currentPulse[i] = 1000;
+    }
+    if (now - escCalibPhaseStartMs >= 3000) {
+      escCalibState = EscCalibState::IDLE;
+      stopAllThrusters();
+      armed = false;
+      Serial.println();
+      Serial.println(F("\033[1;32m[ESC CALIB] Phase 3/3: Outputting NEUTRAL (1500us). ESC calibration COMPLETE!\033[0m"));
+      Serial.println(F("[ESC CALIB] All 6 thrusters neutralized to 1500us. System safe."));
+      CLI::printPrompt();
+    }
+    return;
+  }
+}
+
+void updateAutoRunCountdown(uint32_t now) {
+  const uint32_t elapsedMs = now - countdownStartMs;
+  const int remSec = static_cast<int>(countdownDurationSec) - static_cast<int>(elapsedMs / 1000);
+
+  if (remSec != countdownLastSecLogged) {
+    countdownLastSecLogged = remSec;
+    if (remSec > 0) {
+      Serial.printf("[AUTORUN] Launch countdown: T-%ds... (Send 'stop' to abort)\r\n", remSec);
+    }
+
+    // Surface Tare Calibration (MS5803 zero pressure) at configured autoRunTareSec
+    if (remSec <= settings.autoRunTareSec && !countdownTareDone) {
+      countdownTareDone = true;
+      if (Sensors::calibrateDepthZero(settings)) {
+        Serial.printf("[AUTORUN] Surface tare complete: MS5803 zero reference at %.1f mbar.\r\n",
+                      settings.depthZeroPressureMbar);
+      } else {
+        Serial.println(F("[AUTORUN] Surface tare: MS5803 offline, using stored reference."));
+      }
+    }
+
+    // IMU Leveling Calibration (MPU-6050 level pitch/roll offsets) at configured autoRunLevelSec
+    if (remSec <= settings.autoRunLevelSec && !countdownImuDone) {
+      countdownImuDone = true;
+      if (Sensors::calibrateImuLevel(settings)) {
+        Serial.printf("[AUTORUN] IMU leveling complete: Pitch offset=%.1f°, Roll offset=%.1f°.\r\n",
+                      settings.pitchOffset, settings.rollOffset);
+      } else {
+        Serial.println(F("[AUTORUN] IMU leveling: MPU-6050 offline, using stored offsets."));
+      }
+    }
+
+    // T-1s: Pre-arm notification
+    if (remSec == 1) {
+      Serial.println(F("[AUTORUN] Arming thruster propulsion system..."));
+    }
+  }
+
+  // T-0s: Transition to MISSION_RUNNING
+  if (elapsedMs >= static_cast<uint32_t>(countdownDurationSec) * 1000) {
+    if (Mission::getStepCount() == 0) {
+      Serial.println(F("[AUTORUN] ERROR: No mission steps found in /jalur.json! Aborting launch."));
+      fsmState = FsmState::IDLE;
+      armed = false;
+      stopAllThrusters();
+      CLI::printPrompt();
+    } else {
+      Serial.println();
+      Serial.println(F("\033[1;32m[AUTORUN] T-0s: SYSTEM ARMED! Starting Autonomous Trajectory...\033[0m"));
+      fsmState = FsmState::MISSION_RUNNING;
+      armed = true;
+      thrustersNeutral = false;
+      currentStepIndex = 0;
+      stepStartedAtMs = now;
+      rollIntegral = 0.0f;
+      pitchIntegral = 0.0f;
+      depthIntegral = 0.0f;
+
+      const auto* step = Mission::getStep(0);
+      if (step && step->targetCm > 0.0f) {
+        activeLockedDepthCm = step->targetCm;
+      } else {
+        activeLockedDepthCm = 0.0f;
+      }
+      Serial.printf("[MISSION] Step 1/%u: %s | Action: %s | Power: %.0f%% | Duration: %.1fs",
+                    static_cast<unsigned>(Mission::getStepCount()),
+                    step->name,
+                    Mission::actionToString(step->action),
+                    step->power,
+                    step->durationSec);
+      if (activeLockedDepthCm > 0.0f) {
+        Serial.printf(" | Target: %.0f cm\r\n", activeLockedDepthCm);
+      } else {
+        Serial.println();
+      }
+    }
   }
 }
 
@@ -513,6 +792,8 @@ void setup() {
   // Load configuration from EEPROM or defaults
   if (!Config::loadSettings(settings)) {
     Serial.println(F("[EEPROM] Defaults loaded (fresh EEPROM or version mismatch)."));
+    Config::saveSettings(settings);
+    Serial.println(F("[EEPROM] Version 6 defaults migrated & saved to EEPROM."));
   } else {
     Serial.printf("[EEPROM] Configuration loaded successfully (Checksum: 0x%08lX).\r\n", settings.checksum);
   }
@@ -546,7 +827,10 @@ void setup() {
       []() -> bool { return Sensors::calibrateImuLevel(settings); },
       handleOnInjected,
       handleSetTargetDepth,
-      handleGetTargetDepth
+      handleGetTargetDepth,
+      handleGetFsmState,
+      handleStartEscCalib,
+      handleSetRawPulseAll
   };
   CLI::begin(iface);
 
@@ -585,8 +869,18 @@ void loop() {
     injectionWasActive = true;
   }
 
-  // 1. Process CLI input and stream telemetry
+  // 1. Process CLI input (machine packets & human commands)
   CLI::update();
+
+  // Telemetry Stream Emission (e.g. 10 Hz non-blocking)
+  if (CLI::isTelemActive()) {
+    static uint32_t lastTelemEmitMs = 0;
+    uint32_t telemIntervalMs = 1000 / CLI::getTelemRateHz();
+    if (now - lastTelemEmitMs >= telemIntervalMs) {
+      lastTelemEmitMs = now;
+      CLI::sendTelemPacket();
+    }
+  }
 
   // 2. Update sensor sampling & complementary filters (50 Hz)
   Sensors::update(settings);
@@ -634,74 +928,15 @@ void loop() {
       return;
     }
 
+    // ESC CALIBRATION SEQUENCE GUARD:
+    if (escCalibState != EscCalibState::IDLE) {
+      updateEscCalib(now);
+      return;
+    }
+
     // COUNTDOWN FSM STATE:
     if (fsmState == FsmState::COUNTDOWN) {
-      const uint32_t elapsedMs = now - countdownStartMs;
-      const int remSec = static_cast<int>(countdownDurationSec) - static_cast<int>(elapsedMs / 1000);
-
-      if (remSec != countdownLastSecLogged) {
-        countdownLastSecLogged = remSec;
-        if (remSec > 0) {
-          Serial.printf("[AUTORUN] Launch countdown: T-%ds... (Send 'stop' to abort)\r\n", remSec);
-        }
-
-        // T-3s: Surface Tare Calibration (MS5803 zero pressure)
-        if (remSec <= 3 && !countdownTareDone) {
-          countdownTareDone = true;
-          if (Sensors::calibrateDepthZero(settings)) {
-            Serial.printf("[AUTORUN] Surface tare complete: MS5803 zero reference at %.1f mbar.\r\n",
-                          settings.depthZeroPressureMbar);
-          } else {
-            Serial.println(F("[AUTORUN] Surface tare: MS5803 offline, using stored reference."));
-          }
-        }
-
-        // T-2s: IMU Leveling Calibration (MPU-6050 level pitch/roll offsets)
-        if (remSec <= 2 && !countdownImuDone) {
-          countdownImuDone = true;
-          if (Sensors::calibrateImuLevel(settings)) {
-            Serial.printf("[AUTORUN] IMU leveling complete: Pitch offset=%.1f°, Roll offset=%.1f°.\r\n",
-                          settings.pitchOffset, settings.rollOffset);
-          } else {
-            Serial.println(F("[AUTORUN] IMU leveling: MPU-6050 offline, using stored offsets."));
-          }
-        }
-
-        // T-1s: Pre-arm notification
-        if (remSec == 1) {
-          Serial.println(F("[AUTORUN] Arming thruster propulsion system..."));
-        }
-      }
-
-      // T-0s: Transition to MISSION_RUNNING
-      if (elapsedMs >= static_cast<uint32_t>(countdownDurationSec) * 1000) {
-        if (Mission::getStepCount() == 0) {
-          Serial.println(F("[AUTORUN] ERROR: No mission steps found in /jalur.json! Aborting launch."));
-          fsmState = FsmState::IDLE;
-          armed = false;
-          stopAllThrusters();
-          CLI::printPrompt();
-        } else {
-          Serial.println();
-          Serial.println(F("\033[1;32m[AUTORUN] T-0s: SYSTEM ARMED! Starting Autonomous Trajectory...\033[0m"));
-          fsmState = FsmState::MISSION_RUNNING;
-          armed = true;
-          thrustersNeutral = false;
-          currentStepIndex = 0;
-          stepStartedAtMs = now;
-          rollIntegral = 0.0f;
-          pitchIntegral = 0.0f;
-          depthIntegral = 0.0f;
-
-          const auto* step = Mission::getStep(0);
-          Serial.printf("[MISSION] Step 1/%u: %s | Action: %s | Power: %.0f%% | Duration: %.1fs\r\n",
-                        static_cast<unsigned>(Mission::getStepCount()),
-                        step->name,
-                        Mission::actionToString(step->action),
-                        step->power,
-                        step->durationSec);
-        }
-      }
+      updateAutoRunCountdown(now);
       return;
     }
 

@@ -1,0 +1,2382 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Pusat Kontrol &amp; Konfigurasi Parameter AUV SAUVC 2027 — Universitas Bangka Belitung. Kalibrasi sensor, tuning PID, manajemen 6 thruster vektor, dan eksekusi misi otonom Pico W.">
+  <title>AUV SAUVC 2027 — Pusat Konfigurasi &amp; Kalibrasi | UBB</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <style>
+  /* ============================================================
+     DESIGN TOKENS — Identik dengan Digital Twin Simulator
+     Skala ruang : 4 8 12 16 24 32 48 64
+     Skala tipe  : 11 12 14 16 18 20 24 (Archivo + IBM Plex Mono)
+     Radius      : 4 / 8 / 16
+     Aksen       : Oranye Bakar (#e85a24)
+     ============================================================ */
+  :root {
+    --bg: #0c1116;
+    --surface: #121a21;
+    --surface-2: #18232d;
+    --surface-3: #1f2d3a;
+    --line: #263645;
+    --line-soft: #1c2934;
+    --text: #e9eef2;
+    --muted: #93a5b3;
+    --faint: #617585;
+    --accent: #e85a24;
+    --accent-ink: #ffffff;
+    --accent-soft: #2a1d16;
+    --success: #2da57a;
+    --warning: #d99a26;
+    --danger: #d64545;
+    --info: #4a90b8;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
+    --r-s: 4px; --r-m: 8px; --r-l: 16px;
+    --ease: cubic-bezier(.2, 0, 0, 1);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; min-width: 0; }
+  html { color-scheme: dark; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.55;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  ::selection { background: var(--accent); color: #fff; }
+  button { font-family: inherit; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      transition-duration: .01ms !important;
+    }
+  }
+
+  /* ---------- TOPBAR ---------- */
+  header {
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    padding: var(--s3) var(--s5);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--s5);
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .brand-group { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
+  .logo-badge {
+    background: var(--accent);
+    color: var(--accent-ink);
+    width: 40px;
+    height: 40px;
+    border-radius: var(--r-m);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 16px;
+    letter-spacing: -.02em;
+    flex: none;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    line-height: 1.2;
+  }
+  .title-box h1 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -.01em;
+    line-height: 1.2;
+    text-wrap: balance;
+  }
+  .title-box p { font-size: 12px; color: var(--muted); line-height: 1.4; }
+  .header-actions { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+  .header-badges { display: flex; align-items: center; gap: var(--s4); }
+  .status-item {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    color: var(--text);
+  }
+  .status-item small {
+    display: block;
+    font-size: 12px;
+    color: var(--faint);
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+  .dot-pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    flex: none;
+    animation: pulse 2s var(--ease) infinite;
+  }
+  .dot-pulse.offline { background: var(--danger); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* ---------- BUTTONS ---------- */
+  .btn, .btn-action, .btn-success, .btn-secondary, .btn-primary, .btn-danger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s2);
+    padding: var(--s2) var(--s4);
+    border-radius: var(--r-m);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background-color 150ms var(--ease), border-color 150ms var(--ease), color 150ms var(--ease);
+    font-family: inherit;
+    white-space: nowrap;
+    text-decoration: none;
+  }
+  .btn svg { flex: none; }
+  .btn-primary, .btn-action {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+  .btn-primary:hover, .btn-action:hover {
+    background: #cf4c1c;
+    border-color: #cf4c1c;
+  }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--line);
+  }
+  .btn-secondary:hover {
+    border-color: var(--muted);
+    background: var(--surface-2);
+  }
+  .btn-success {
+    background: var(--success);
+    color: #ffffff;
+    border-color: var(--success);
+  }
+  .btn-success:hover {
+    background: #248a64;
+    border-color: #248a64;
+  }
+  .btn-danger {
+    background: transparent;
+    color: #f08a8a;
+    border-color: #5a2b2b;
+  }
+  .btn-danger:hover {
+    background: #2a1616;
+    border-color: var(--danger);
+    color: #fff;
+  }
+  .btn-sm {
+    padding: var(--s1) var(--s3);
+    font-size: 11px;
+  }
+
+  /* ---------- LAYOUT CONTAINER ---------- */
+  .container {
+    width: 100%;
+    max-width: 1560px;
+    margin: 0 auto;
+    padding: var(--s5);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--s5);
+    flex: 1;
+    align-items: start;
+  }
+  @media (max-width: 1100px) {
+    .container {
+      grid-template-columns: minmax(0, 1fr);
+      padding: var(--s4);
+    }
+    .tele-grid { grid-template-columns: repeat(3, 1fr); }
+    .thrusters-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 768px) {
+    .container { padding: var(--s3); }
+    .card { padding: var(--s3); }
+    .tele-grid { grid-template-columns: repeat(2, 1fr); }
+    .thrusters-grid { grid-template-columns: repeat(2, 1fr); }
+    .motion-grid { grid-template-columns: 1fr; }
+  }
+  .col-span-full {
+    grid-column: 1 / -1;
+  }
+
+  /* ---------- CARDS & HEADERS ---------- */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-l);
+    padding: var(--s5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s4);
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--s3);
+    flex-wrap: wrap;
+    padding-bottom: var(--s3);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .card-header h2 {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    color: var(--text);
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+  }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .card-meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+    white-space: nowrap;
+  }
+
+  /* ---------- BADGES & CHIPS ---------- */
+  .card-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    padding: 2px var(--s2);
+    border-radius: var(--r-s);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    background: var(--surface-2);
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+  }
+  .badge-green { color: var(--success); border-color: rgba(45,165,122,0.4); background: rgba(45,165,122,0.12); }
+  .badge-yellow { color: var(--warning); border-color: rgba(217,154,38,0.4); background: rgba(217,154,38,0.12); }
+  .badge-red { color: var(--danger); border-color: rgba(214,69,69,0.4); background: rgba(214,69,69,0.12); }
+  .badge-cyan { color: var(--info); border-color: rgba(74,144,184,0.4); background: rgba(74,144,184,0.12); }
+  .badge-purple { color: #a78bfa; border-color: rgba(167,139,250,0.4); background: rgba(167,139,250,0.12); }
+
+  /* ---------- TELEMETRY GAUGES (SECTION 01) ---------- */
+  .tele-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: var(--s3);
+  }
+  @media (max-width: 1100px) {
+    .tele-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 640px) {
+    .tele-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  .tele-stat-card {
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-m);
+    padding: var(--s3);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: var(--s1);
+  }
+  .tele-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    gap: 4px;
+  }
+  .tele-chip {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--faint);
+  }
+  .tele-value-box {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s1);
+    margin: var(--s1) 0;
+  }
+  .tele-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -.02em;
+    color: var(--text);
+    line-height: 1.1;
+  }
+  .tele-unit {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--faint);
+  }
+  .tele-subtext {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mini-horizon-bar {
+    height: 6px;
+    background: var(--bg);
+    border-radius: var(--r-s);
+    position: relative;
+    overflow: hidden;
+    margin-top: var(--s2);
+    border: 1px solid var(--line-soft);
+  }
+  .mini-horizon-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    transition: width 150ms var(--ease), left 150ms var(--ease);
+  }
+
+  /* ---------- THRUSTERS GRID (SECTION 02) ---------- */
+  .thrusters-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: var(--s3);
+  }
+  @media (max-width: 1200px) {
+    .thrusters-grid { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 640px) {
+    .thrusters-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  .thruster-card {
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-left: 4px solid var(--line);
+    border-radius: var(--r-m);
+    padding: var(--s3);
+    transition: border-color 200ms var(--ease), background-color 200ms var(--ease);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: var(--s2);
+  }
+  .thruster-card.active {
+    border-left-color: var(--accent);
+    background: var(--surface-3);
+  }
+  .thruster-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .thruster-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: var(--text);
+  }
+  .thruster-subpos {
+    font-size: 11px;
+    color: var(--muted);
+    display: block;
+    margin-top: 1px;
+  }
+  .pulse-badge {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px var(--s2);
+    border-radius: var(--r-s);
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line-soft);
+    display: inline-block;
+  }
+  .power-bar-wrap {
+    height: 8px;
+    background: var(--bg);
+    border-radius: var(--r-s);
+    position: relative;
+    overflow: hidden;
+    margin: 2px 0;
+    border: 1px solid var(--line-soft);
+  }
+  .power-bar-center-line {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--line);
+    z-index: 2;
+  }
+  .power-bar-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    transition: width 100ms linear, left 100ms linear;
+  }
+  .thruster-pwr-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: var(--r-s);
+    background: var(--surface-3);
+    color: var(--muted);
+  }
+  .thruster-pwr-badge.pwr-pos { color: var(--success); background: rgba(45,165,122,0.15); }
+  .thruster-pwr-badge.pwr-neg { color: var(--danger); background: rgba(214,69,69,0.15); }
+  .thruster-pwr-badge.pwr-zero { color: var(--faint); background: var(--bg); }
+  .thruster-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+
+  /* ---------- SUB-CARDS ---------- */
+  .sub-card {
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-m);
+    padding: var(--s4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s3);
+  }
+  .sub-card-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--s2);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    color: var(--text);
+    flex-wrap: wrap;
+  }
+
+  /* ---------- PRESET PILLS ---------- */
+  .preset-pill-group {
+    display: inline-flex;
+    gap: var(--s1);
+    background: var(--bg);
+    padding: 2px;
+    border-radius: var(--r-m);
+    border: 1px solid var(--line);
+  }
+  .preset-pill {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px var(--s2);
+    border-radius: var(--r-s);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 150ms var(--ease);
+  }
+  .preset-pill:hover {
+    color: var(--text);
+    border-color: var(--line);
+    background: var(--surface-2);
+  }
+  .preset-pill.active {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+
+  
+  .pid-tuning-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--s3);
+  }
+  @media (max-width: 900px) {
+    .pid-tuning-grid { grid-template-columns: 1fr; }
+  }
+  .calib-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s4);
+  }
+  @media (max-width: 768px) {
+    .calib-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ---------- D-PAD & MOTION (SECTION 03) ---------- */
+  .motion-grid {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: var(--s4);
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .motion-grid { grid-template-columns: 1fr; }
+  }
+  .dpad-container {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--s2);
+    width: 220px;
+    margin: 0 auto;
+  }
+  .btn-motion {
+    background: var(--surface-3);
+    border: 1px solid var(--line);
+    border-radius: var(--r-m);
+    color: var(--text);
+    padding: var(--s2);
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    cursor: pointer;
+    transition: all 150ms var(--ease);
+    min-height: 52px;
+  }
+  .btn-motion:hover {
+    background: var(--surface-2);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-motion.center-stop {
+    background: rgba(214, 69, 69, 0.15);
+    border-color: #5a2b2b;
+    color: #f08a8a;
+  }
+  .btn-motion.center-stop:hover {
+    background: #2a1616;
+    border-color: var(--danger);
+    color: #fff;
+  }
+  .heave-controls {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s3);
+  }
+  .btn-heave {
+    background: var(--surface-3);
+    border: 1px solid var(--line);
+    border-radius: var(--r-m);
+    color: var(--text);
+    padding: var(--s2) var(--s3);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s2);
+    transition: all 150ms var(--ease);
+  }
+  .btn-heave:hover {
+    background: var(--surface-2);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Micro test rows */
+  .motor-test-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--s2);
+  }
+  @media (max-width: 500px) {
+    .motor-test-grid { grid-template-columns: 1fr; }
+  }
+  .motor-test-item {
+    background: var(--surface-3);
+    padding: var(--s2);
+    border-radius: var(--r-m);
+    border: 1px solid var(--line-soft);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .motor-test-item-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* ---------- FORM CONTROLS & SWITCHES ---------- */
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 38px;
+    height: 20px;
+    flex: none;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider-toggle {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-color: var(--surface-3);
+    border: 1px solid var(--line);
+    transition: .2s var(--ease);
+    border-radius: 20px;
+  }
+  .slider-toggle:before {
+    position: absolute;
+    content: "";
+    height: 14px;
+    width: 14px;
+    left: 2px;
+    bottom: 2px;
+    background-color: var(--muted);
+    transition: .2s var(--ease);
+    border-radius: 50%;
+  }
+  input:checked + .slider-toggle {
+    background-color: var(--accent);
+    border-color: var(--accent);
+  }
+  input:checked + .slider-toggle:before {
+    transform: translateX(18px);
+    background-color: var(--accent-ink);
+  }
+
+  input[type=range] {
+    width: 100%;
+    height: 4px;
+    border-radius: var(--r-s);
+    background: var(--surface-3);
+    outline-offset: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--text);
+    border: 2px solid var(--bg);
+    cursor: pointer;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--text);
+    border: 2px solid var(--bg);
+    cursor: pointer;
+  }
+
+  .input-number, .input-text {
+    background: var(--surface-3);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: var(--s1) var(--s2);
+    border-radius: var(--r-s);
+    outline: none;
+    transition: border-color 150ms var(--ease);
+  }
+  .input-number:focus, .input-text:focus {
+    border-color: var(--accent);
+    outline: none;
+  }
+  .input-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+
+  /* ---------- TABLES ---------- */
+  .table-wrap {
+    overflow-x: auto;
+    width: 100%;
+    max-width: 100%;
+    border-radius: var(--r-m);
+    border: 1px solid var(--line-soft);
+    -webkit-overflow-scrolling: touch;
+  }
+  .data-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12px;
+  }
+  .data-table th {
+    background: var(--surface-3);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    text-align: left;
+    padding: var(--s2) var(--s3);
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  .data-table td {
+    padding: var(--s2) var(--s3);
+    border-bottom: 1px solid var(--line-soft);
+    color: var(--text);
+    vertical-align: middle;
+  }
+  .data-table tr:last-child td { border-bottom: none; }
+  .data-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+  .data-table tr.active-step td {
+    background: rgba(232, 90, 36, 0.12);
+    border-bottom-color: var(--accent);
+  }
+
+  /* ---------- TERMINAL (SECTION 07) ---------- */
+  .terminal-box {
+    background: #05080b;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-m);
+    height: 220px;
+    overflow-y: auto;
+    padding: var(--s3);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+  .terminal-box::-webkit-scrollbar { width: 4px; }
+  .terminal-box::-webkit-scrollbar-thumb { background: var(--line); border-radius: var(--r-s); }
+  .term-line { word-break: break-all; }
+  .term-line.cmd { color: var(--accent); font-weight: 600; }
+  .term-line.resp-ok { color: var(--success); }
+  .term-line.resp-warn { color: var(--warning); }
+  .term-line.resp-err { color: var(--danger); font-weight: 600; }
+  .term-line.resp-status { color: var(--info); }
+  .term-line.resp-dim { color: var(--faint); }
+
+  /* ---------- TOAST NOTIFICATIONS ---------- */
+  #toastContainer {
+    position: fixed;
+    top: 72px;
+    right: var(--s5);
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    padding: var(--s3) var(--s4);
+    border-radius: var(--r-m);
+    font-size: 13px;
+    font-family: var(--sans);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    transition: opacity 300ms var(--ease), transform 300ms var(--ease);
+    max-width: 420px;
+  }
+  .toast.success { border-left: 4px solid var(--success); }
+  .toast.error { border-left: 4px solid var(--danger); }
+  .toast.warning { border-left: 4px solid var(--warning); }
+  .toast.info { border-left: 4px solid var(--info); }
+
+  /* ---------- FOOTER ---------- */
+  footer {
+    border-top: 1px solid var(--line-soft);
+    padding: var(--s4) var(--s5);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--faint);
+    display: flex;
+    justify-content: space-between;
+    gap: var(--s4);
+    flex-wrap: wrap;
+    margin-top: auto;
+  }
+
+  @media (max-width: 640px) {
+    .container { padding: var(--s4); }
+    .card { padding: var(--s4); }
+    header { padding: var(--s3) var(--s4); }
+  }
+  </style>
+</head>
+<body>
+
+  <!-- TOAST CONTAINER -->
+  <div id="toastContainer"></div>
+
+  <!-- HEADER -->
+  <header>
+    <div class="brand-group">
+      <div class="logo-badge" aria-hidden="true">V6</div>
+      <div class="title-box">
+        <div class="eyebrow">SAUVC 2027 · RoboNation</div>
+        <h1>AUV — Pusat Konfigurasi &amp; Kalibrasi</h1>
+        <p>Universitas Bangka Belitung · 6 thruster vektor · Pico W</p>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
+      <div class="header-badges">
+        <div class="status-item"><span id="hwDot" class="dot-pulse offline"></span><span><span id="hwStatusText">MENGHUBUNGKAN…</span><small>Perangkat keras</small></span></div>
+        <div class="status-item"><span><span id="hzBadge">0.0 Hz</span><small>UART Bridge</small></span></div>
+      </div>
+      <div class="header-actions">
+        <a href="index.html" class="btn btn-secondary" style="text-decoration:none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 6c.6.5 1.2 1 2.5 1C7 7 7 5 9.5 5c2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1M2 12c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1M2 18c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/></svg> Simulasi 2D</a>
+        <button class="btn btn-primary" onclick="commitSaveEEPROM()" title="Simpan konfigurasi ke Flash EEPROM RP2040">Simpan EEPROM</button>
+        <button class="btn btn-secondary" onclick="resetFactoryDefaults()" title="Reset parameter RAM ke nilai default pabrik">Reset Default</button>
+        <button class="btn btn-danger" onclick="triggerManeuver('stop')" title="Stop darurat — netralkan semua motor ke 1500 µs">Stop Darurat</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- DASHBOARD CONTAINER -->
+  <div class="container">
+
+    <!-- ============================================================
+         SEKSI 01 · MONITORING TELEMETRI SENSOR (REAL-TIME)
+         ============================================================ -->
+    <section class="card col-span-full" aria-label="Monitoring Telemetri">
+      <div class="card-header">
+        <h2><span class="sec-num">01</span> Monitoring Telemetri Sensor (Real-Time)</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="card-badge badge-cyan" id="fsmBadge">STATE: STANDBY</span>
+          <span class="card-badge badge-green" id="pidHeaderBadge">PID: OFF</span>
+        </div>
+      </div>
+
+      <div class="tele-grid">
+        <!-- KEDALAMAN -->
+        <div class="tele-stat-card">
+          <div class="tele-label">
+            <span>Kedalaman (Depth)</span>
+            <span class="tele-chip">MS5803</span>
+          </div>
+          <div class="tele-value-box">
+            <span class="tele-value" id="valDepth">0.0</span>
+            <span class="tele-unit">cm</span>
+          </div>
+          <div class="tele-subtext" id="targetDepthText">Target: 0.0 cm</div>
+          <div class="mini-horizon-bar">
+            <div class="mini-horizon-fill" id="depthGaugeFill" style="left: 0; width: 0%; background: var(--info);"></div>
+          </div>
+        </div>
+
+        <!-- TEKANAN AIR -->
+        <div class="tele-stat-card">
+          <div class="tele-label">
+            <span>Tekanan Air</span>
+            <span id="calibZeroPill" class="card-badge badge-yellow" style="font-size:10px; padding:1px 6px;">TARE PENDING</span>
+          </div>
+          <div class="tele-value-box">
+            <span class="tele-value" id="valPressure">1013.2</span>
+            <span class="tele-unit">mbar</span>
+          </div>
+          <div class="tele-subtext" id="zeroRefText">Ref Nol: 1013.25 mbar</div>
+          <div class="mini-horizon-bar">
+            <div class="mini-horizon-fill" id="pressureGaugeFill" style="left: 0; width: 50%; background: #818cf8;"></div>
+          </div>
+        </div>
+
+        <!-- ROLL (KEMIRINGAN LATERAL) -->
+        <div class="tele-stat-card">
+          <div class="tele-label">
+            <span>Kemiringan Roll</span>
+            <span class="tele-chip">MPU-6050</span>
+          </div>
+          <div class="tele-value-box">
+            <span class="tele-value" id="valRoll">+0.0</span>
+            <span class="tele-unit">°</span>
+          </div>
+          <div class="tele-subtext" id="rollOffText">Level Trim: 0.00°</div>
+          <div class="mini-horizon-bar">
+            <div class="mini-horizon-fill" id="rollHorizonFill" style="left: 50%; width: 0%;"></div>
+          </div>
+        </div>
+
+        <!-- PITCH (KEMIRINGAN HALUAN) -->
+        <div class="tele-stat-card">
+          <div class="tele-label">
+            <span>Kemiringan Pitch</span>
+            <span class="tele-chip">MPU-6050</span>
+          </div>
+          <div class="tele-value-box">
+            <span class="tele-value" id="valPitch">+0.0</span>
+            <span class="tele-unit">°</span>
+          </div>
+          <div class="tele-subtext" id="pitchOffText">Level Trim: 0.00°</div>
+          <div class="mini-horizon-bar">
+            <div class="mini-horizon-fill" id="pitchHorizonFill" style="left: 50%; width: 0%;"></div>
+          </div>
+        </div>
+
+        <!-- SUHU & GYRO -->
+        <div class="tele-stat-card">
+          <div class="tele-label">
+            <span>Suhu Internal</span>
+            <span class="tele-chip">I2C Temp</span>
+          </div>
+          <div class="tele-value-box">
+            <span class="tele-value" id="valTemp">28.5</span>
+            <span class="tele-unit">°C</span>
+          </div>
+          <div class="tele-subtext" id="gyroText">Gyro: [0.0, 0.0, 0.0] dps</div>
+          <div class="mini-horizon-bar">
+            <div class="mini-horizon-fill" style="left: 0; width: 35%; background: var(--success);"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 02 · STATUS 6 THRUSTER (PULSA & DAYA)
+         ============================================================ -->
+    <section class="card col-span-full" aria-label="Status 6 Thruster">
+      <div class="card-header">
+        <h2><span class="sec-num">02</span> Status 6 Thruster (Pulsa &amp; Daya)</h2>
+        <span class="card-meta">Netral 1500 µs · Feedback Live RP2040</span>
+      </div>
+
+      <div class="thrusters-grid">
+        <!-- T1 -->
+        <div class="thruster-card" id="tcard1">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T1 (GP2)</span>
+              <span class="thruster-subpos">Belakang-Kiri (CW)</span>
+            </div>
+            <span class="card-badge badge-cyan" id="trole1">HORIZ</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse1">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr1">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill1" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir1" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+
+        <!-- T2 -->
+        <div class="thruster-card" id="tcard2">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T2 (GP3)</span>
+              <span class="thruster-subpos">Depan-Kanan (CW)</span>
+            </div>
+            <span class="card-badge badge-cyan" id="trole2">HORIZ</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse2">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr2">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill2" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir2" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+
+        <!-- T3 -->
+        <div class="thruster-card" id="tcard3">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T3 (GP4)</span>
+              <span class="thruster-subpos">Depan-Kiri (CCW)</span>
+            </div>
+            <span class="card-badge badge-cyan" id="trole3">HORIZ</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse3">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr3">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill3" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir3" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+
+        <!-- T4 -->
+        <div class="thruster-card" id="tcard4">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T4 (GP5)</span>
+              <span class="thruster-subpos">Belakang-Kanan (CCW)</span>
+            </div>
+            <span class="card-badge badge-cyan" id="trole4">HORIZ</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse4">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr4">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill4" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir4" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+
+        <!-- T5 -->
+        <div class="thruster-card" id="tcard5">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T5 (GP6)</span>
+              <span class="thruster-subpos">Vertikal Kanan (CW)</span>
+            </div>
+            <span class="card-badge badge-purple" id="trole5">VERTIKAL</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse5">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr5">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill5" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir5" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+
+        <!-- T6 -->
+        <div class="thruster-card" id="tcard6">
+          <div class="thruster-card-header">
+            <div>
+              <span class="thruster-title">T6 (GP7)</span>
+              <span class="thruster-subpos">Vertikal Kiri (CCW)</span>
+            </div>
+            <span class="card-badge badge-purple" id="trole6">VERTIKAL</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin:var(--s2) 0 var(--s1)">
+            <span class="pulse-badge" id="tpulse6">1500 µs</span>
+            <span class="thruster-pwr-badge pwr-zero" id="tpwr6">0.0%</span>
+          </div>
+          <div class="power-bar-wrap">
+            <div class="power-bar-center-line"></div>
+            <div class="power-bar-fill" id="tfill6" style="left: 50%; width: 0%;"></div>
+          </div>
+          <div class="thruster-footer">
+            <span style="color:var(--muted)">Aksi</span>
+            <span id="tdir6" style="color:var(--faint);font-weight:600">NETRAL</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 03 · UJI GERAK & MANUAL D-PAD
+         ============================================================ -->
+    <section class="card" aria-label="Uji Gerak dan Manual D-Pad">
+      <div class="card-header">
+        <h2><span class="sec-num">03</span> Uji Gerak &amp; Manual D-Pad (Maju, Mundur, Putar, Selam)</h2>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:12px;color:var(--muted);font-weight:600">Daya Uji:</span>
+          <div class="preset-pill-group">
+            <div class="preset-pill" onclick="setTestPower(5)">5%</div>
+            <div class="preset-pill" onclick="setTestPower(10)">10%</div>
+            <div class="preset-pill active" id="pillPwr15" onclick="setTestPower(15)">15%</div>
+            <div class="preset-pill" onclick="setTestPower(20)">20%</div>
+            <div class="preset-pill" onclick="setTestPower(25)">25%</div>
+          </div>
+          <span style="font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent)" id="lblTestPwr">15%</span>
+        </div>
+      </div>
+
+      <div class="motion-grid">
+        <!-- DIRECTIONAL D-PAD & HEAVE -->
+        <div class="sub-card">
+          <div class="sub-card-title">
+            <span>🧭 Directional Motion Pad</span>
+            <span class="card-badge badge-cyan">CLI Shortcut</span>
+          </div>
+
+          <div class="dpad-container">
+            <div></div>
+            <button class="btn-motion" onclick="triggerManeuver('forward')" title="Maju: T1..T4 Forward (+15%)">
+              <span style="font-size:16px">⬆️</span>
+              <span>MAJU</span>
+            </button>
+            <div></div>
+
+            <button class="btn-motion" onclick="triggerManeuver('turn_left')" title="Putar Kiri: Yaw CCW">
+              <span style="font-size:16px">🔄</span>
+              <span>PUTAR L</span>
+            </button>
+            <button class="btn-motion center-stop" onclick="triggerManeuver('stop')" title="Stop Darurat: Netralkan Semua">
+              <span style="font-size:16px">⏹</span>
+              <span>STOP</span>
+            </button>
+            <button class="btn-motion" onclick="triggerManeuver('turn_right')" title="Putar Kanan: Yaw CW">
+              <span style="font-size:16px">🔃</span>
+              <span>PUTAR R</span>
+            </button>
+
+            <div></div>
+            <button class="btn-motion" onclick="triggerManeuver('backward')" title="Mundur: T1..T4 Reverse (-15%)">
+              <span style="font-size:16px">⬇️</span>
+              <span>MUNDUR</span>
+            </button>
+            <div></div>
+          </div>
+
+          <div class="heave-controls">
+            <button class="btn-heave" onclick="triggerManeuver('dive')" title="Selam: T5 &amp; T6 Downward (+15%)">
+              <span>⏬ SELAM (DIVE)</span>
+            </button>
+            <button class="btn-heave" onclick="triggerManeuver('surface')" title="Naik: T5 &amp; T6 Upward (-15%)">
+              <span>⏫ NAIK (SURFACE)</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- INDIVIDUAL MOTOR TESTS & MISSION ACTIONS -->
+        <div class="sub-card">
+          <div class="sub-card-title">
+            <span>🧪 Uji Motor Individu (T1 - T6)</span>
+            <button class="btn-secondary btn-sm" onclick="triggerTestMotor(0, getActiveTestPower())">
+              ⚡ TEST ALL (6 MOTOR)
+            </button>
+          </div>
+
+          <div class="motor-test-grid">
+            <!-- T1 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T1 (Rear-L)</span><span style="font-family:var(--mono);color:var(--faint)">GP2</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(1, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(1, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(1, 0)">⏹</button>
+              </div>
+            </div>
+            <!-- T2 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T2 (Front-R)</span><span style="font-family:var(--mono);color:var(--faint)">GP3</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(2, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(2, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(2, 0)">⏹</button>
+              </div>
+            </div>
+            <!-- T3 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T3 (Front-L)</span><span style="font-family:var(--mono);color:var(--faint)">GP4</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(3, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(3, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(3, 0)">⏹</button>
+              </div>
+            </div>
+            <!-- T4 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T4 (Rear-R)</span><span style="font-family:var(--mono);color:var(--faint)">GP5</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(4, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(4, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(4, 0)">⏹</button>
+              </div>
+            </div>
+            <!-- T5 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T5 (Vert-R)</span><span style="font-family:var(--mono);color:var(--faint)">GP6</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(5, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(5, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(5, 0)">⏹</button>
+              </div>
+            </div>
+            <!-- T6 -->
+            <div class="motor-test-item">
+              <div class="motor-test-item-title"><span>T6 (Vert-L)</span><span style="font-family:var(--mono);color:var(--faint)">GP7</span></div>
+              <div style="display:flex;gap:4px">
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(6, getActiveTestPower())">+15%</button>
+                <button class="btn-secondary btn-sm" style="flex:1;padding:4px 0" onclick="triggerTestMotor(6, -getActiveTestPower())">-15%</button>
+                <button class="btn-danger btn-sm" style="padding:4px 8px" onclick="triggerTestMotor(6, 0)">⏹</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- AUTONOMOUS MISSION TRIGGERS -->
+          <div style="margin-top:4px;padding-top:10px;border-top:1px solid var(--line-soft)">
+            <span style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:8px">
+              Eksekusi Misi Otonom:
+            </span>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-success btn-sm" onclick="triggerMission('run')" title="Mulai countdown 10s &amp; tare otomatis">
+                ▶ RUN JALUR
+              </button>
+              <button class="btn-secondary btn-sm" onclick="triggerMission('run_now')" title="Arming &amp; langsung jalankan tanpa countdown">
+                ⚡ RUN NOW
+              </button>
+              <button class="btn-danger btn-sm" onclick="triggerMission('stop')" title="Stop dan batalkan misi">
+                ⏹ STOP MISI
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 04 · PENYETELAN PARAMETER (TUNING)
+         ============================================================ -->
+    <section class="card" aria-label="Penyetelan Parameter">
+      <div class="card-header">
+        <h2><span class="sec-num">04</span> Penyetelan Parameter (Power Limit, PID, Trim, Reverse)</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn-primary btn-sm" onclick="commitSaveEEPROM()" title="Commit seluruh parameter &amp; offset ke Flash EEPROM RP2040">💾 Simpan EEPROM</button>
+          <button class="btn-secondary btn-sm" onclick="resetFactoryDefaults()" title="Kembalikan setting RAM ke default pabrik firmware">Reset Default</button>
+        </div>
+      </div>
+
+      <!-- 1. SAFETY POWER LIMIT -->
+      <div class="sub-card">
+        <div class="sub-card-title">
+          <span>🛡️ Batas Daya Maksimum Robot (Safety Power Ceiling Limit)</span>
+          <span class="card-badge" id="limitBadge" style="font-size:12px;font-weight:700">25%</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--success)">1%</span>
+            <input type="range" id="powerLimitSlider" min="1" max="100" value="25" oninput="onPowerLimitInput(this.value)" style="flex:1">
+            <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--danger)">100%</span>
+            <input type="number" id="powerLimitNum" min="1" max="100" value="25" class="input-number" style="width:64px" oninput="onPowerLimitInput(this.value)">
+            <button class="btn-secondary btn-sm" onclick="applyPowerLimit()">Terapkan</button>
+          </div>
+          <div id="powerLimitWarning" style="font-size:12px;font-weight:600;color:var(--success)">
+            ✅ Batas 25% aktif: Sangat aman untuk pengujian bangku (mencegah overheat dan sentakan mekanis).
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. CLOSED-LOOP PID STABILIZATION -->
+      <div class="sub-card">
+        <div class="sub-card-title">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span>🔄 Stabilisasi PID Tertutup</span>
+            <label class="switch">
+              <input type="checkbox" id="pidMasterToggle" onchange="togglePidMaster(this.checked)">
+              <span class="slider-toggle"></span>
+            </label>
+            <span id="pidMasterStatus" style="font-family:var(--mono);font-size:12px;font-weight:700;color:var(--warning)">PID NONAKTIF</span>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn-secondary btn-sm" onclick="loadPidPreset('bench')">Bench Safe</button>
+            <button class="btn-secondary btn-sm" onclick="loadPidPreset('default')">Default EEPROM</button>
+          </div>
+        </div>
+
+        <!-- 3 PID GAIN BOXES: ROLL, PITCH, DEPTH -->
+        <div class="pid-tuning-grid">
+          <!-- ROLL PID -->
+          <div style="background:var(--surface-3);padding:var(--s3);border-radius:var(--r-m);border:1px solid var(--line-soft)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-weight:700;font-size:12px;color:var(--info)">Roll (Miring X)</span>
+              <span class="card-badge badge-cyan">T5 ⇄ T6</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kp</span><input type="number" id="rollKp" step="0.01" class="input-number" style="flex:1" value="0.80"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Ki</span><input type="number" id="rollKi" step="0.001" class="input-number" style="flex:1" value="0.000"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kd</span><input type="number" id="rollKd" step="0.001" class="input-number" style="flex:1" value="0.008"></div>
+              <button class="btn-secondary btn-sm" style="margin-top:2px;justify-content:center" onclick="applyPidAxis('roll')">Terapkan</button>
+            </div>
+          </div>
+
+          <!-- PITCH PID -->
+          <div style="background:var(--surface-3);padding:var(--s3);border-radius:var(--r-m);border:1px solid var(--line-soft)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-weight:700;font-size:12px;color:#a78bfa">Pitch (Angguk Y)</span>
+              <span class="card-badge badge-purple">T5 ⇄ T6</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kp</span><input type="number" id="pitchKp" step="0.01" class="input-number" style="flex:1" value="0.80"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Ki</span><input type="number" id="pitchKi" step="0.001" class="input-number" style="flex:1" value="0.000"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kd</span><input type="number" id="pitchKd" step="0.001" class="input-number" style="flex:1" value="0.008"></div>
+              <button class="btn-secondary btn-sm" style="margin-top:2px;justify-content:center" onclick="applyPidAxis('pitch')">Terapkan</button>
+            </div>
+          </div>
+
+          <!-- DEPTH PID -->
+          <div style="background:var(--surface-3);padding:var(--s3);border-radius:var(--r-m);border:1px solid var(--line-soft)">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-weight:700;font-size:12px;color:var(--success)">Depth (Selam Z)</span>
+              <span class="card-badge badge-green">MS5803</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kp</span><input type="number" id="depthKp" step="0.01" class="input-number" style="flex:1" value="0.60"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Ki</span><input type="number" id="depthKi" step="0.001" class="input-number" style="flex:1" value="0.000"></div>
+              <div class="input-row"><span style="width:24px;font-family:var(--mono);font-size:11px;color:var(--muted)">Kd</span><input type="number" id="depthKd" step="0.001" class="input-number" style="flex:1" value="0.015"></div>
+              <button class="btn-secondary btn-sm" style="margin-top:2px;justify-content:center" onclick="applyPidAxis('depth')">Terapkan</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. MOTOR REVERSE & SPEED TRIM MULTIPLIER TABLE -->
+      <div class="sub-card">
+        <div class="sub-card-title">
+          <span>⚡ Polaritas Reverse &amp; Speed Trim Multiplier (T1 - T6)</span>
+          <button class="btn-secondary btn-sm" onclick="applyHandednessPreset()">
+            🔄 Standar Propeller UBB
+          </button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Posisi &amp; Baling-baling</th>
+                <th>GPIO</th>
+                <th>Reverse Polarity</th>
+                <th>Speed Trim Multiplier</th>
+                <th>Aksi</th>
+              </tr>
+            </thead>
+            <tbody id="thrusterConfigBody">
+              <!-- Rendered via JS -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 4. AUTO-RUN ON BOOT CONFIG -->
+      <div class="sub-card">
+        <div class="sub-card-title">
+          <span>⏱️ Auto-Run Saat Booting (Peluncuran Otonom)</span>
+          <span class="card-badge badge-cyan">Countdown Pre-Dive</span>
+        </div>
+
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:10px">
+            <label class="switch">
+              <input type="checkbox" id="autorunToggle">
+              <span class="slider-toggle"></span>
+            </label>
+            <span id="autorunToggleLabel" style="font-size:13px;font-weight:700;color:var(--text)">Aktifkan Auto-Run</span>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:240px">
+            <span style="font-size:12px;color:var(--muted);font-weight:600">Delay:</span>
+            <input type="range" id="autorunDelaySlider" min="3" max="60" value="10" oninput="document.getElementById('autorunDelayNum').value = this.value" style="flex:1">
+            <input type="number" id="autorunDelayNum" min="3" max="60" value="10" class="input-number" style="width:56px" oninput="document.getElementById('autorunDelaySlider').value = this.value">
+            <span style="font-family:var(--mono);font-size:11px;color:var(--faint)">dtk</span>
+          </div>
+
+          <button class="btn-secondary btn-sm" onclick="applyAutoRunConfig()">Simpan Auto-Run</button>
+        </div>
+
+        <div style="font-size:12px;color:var(--muted);line-height:1.4">
+          ℹ️ <b>SOP Peluncuran:</b> Letakkan robot terapung tenang di permukaan. Selama hitung mundur, sistem akan otomatis melakukan <b>Tare Nol Kedalaman</b> pada T-3s, lalu <b>Leveling IMU</b> pada T-2s, dan pada T-0s langsung mengeksekusi misi <code>/jalur.json</code>.
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 05 · KALIBRASI SENSOR 1-KLIK
+         ============================================================ -->
+    <section class="card" aria-label="Kalibrasi Sensor">
+      <div class="card-header">
+        <h2><span class="sec-num">05</span> Kalibrasi Sensor 1-Klik (Zero Depth, Level IMU)</h2>
+        <span class="card-badge badge-green" id="calibLastTimeBadge">TERAKHIR: BELUM ADA</span>
+      </div>
+
+      <div class="calib-grid">
+        <!-- CALIB ZERO (DEPTH) -->
+        <div class="sub-card">
+          <div class="sub-card-title">
+            <span>⚖️ Tare Nol Kedalaman (Calib Zero)</span>
+            <span class="card-badge badge-cyan">MS5803</span>
+          </div>
+          <p style="font-size:12px;color:var(--muted);line-height:1.4">
+            Merekam tekanan atmosfer saat ini sebagai referensi <b>0.0 cm</b> permukaan air. Lakukan saat robot mengapung tenang sebelum menyelam.
+          </p>
+
+          <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+            <button class="btn-success btn-sm" style="flex:1" onclick="triggerCalib('zero')">
+              ⚖️ TARE NOL KEDALAMAN
+            </button>
+            <input type="number" id="manualZeroPres" placeholder="mbar (opt)" class="input-number" style="width:110px" step="0.1">
+          </div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--faint)" id="calibZeroFeedback">
+            Ref aktif: 1013.25 mbar (Tekan tombol di atas saat di permukaan kolam).
+          </div>
+        </div>
+
+        <!-- CALIB LEVEL (IMU) -->
+        <div class="sub-card">
+          <div class="sub-card-title">
+            <span>📐 Leveling Horizontal IMU (Calib Level)</span>
+            <span class="card-badge badge-purple">MPU-6050</span>
+          </div>
+          <p style="font-size:12px;color:var(--muted);line-height:1.4">
+            Merekam sudut kemiringan saat ini sebagai referensi <b>0.0° Pitch &amp; Roll</b>. Lakukan saat robot berada di posisi datar sempurna di meja atau air tenang.
+          </p>
+
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+            <button class="btn-secondary btn-sm" style="flex:1" onclick="triggerCalib('level')">
+              📐 LEVELING HORIZONTAL
+            </button>
+            <input type="number" id="manualPitchOff" placeholder="Pitch°" class="input-number" style="width:68px" step="0.1">
+            <input type="number" id="manualRollOff" placeholder="Roll°" class="input-number" style="width:68px" step="0.1">
+          </div>
+          <div style="font-family:var(--mono);font-size:11px;color:var(--faint)" id="calibLevelFeedback">
+            Offset aktif: Pitch +0.00°, Roll +0.00°.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 06 · RUTE MISI OTONOM (/jalur.json)
+         ============================================================ -->
+    <section class="card" aria-label="Rute Misi Otonom">
+      <div class="card-header">
+        <h2><span class="sec-num">06</span> Rute Misi Otonom (/jalur.json)</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn-secondary btn-sm" onclick="reloadJalurServer()">Reload Jalur</button>
+          <button class="btn-primary btn-sm" onclick="triggerMission('run')">Jalankan Misi</button>
+          <button class="btn-danger btn-sm" onclick="triggerMission('stop')">Batal / Stop</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table" id="missionTable">
+          <thead>
+            <tr>
+              <th style="width:44px">Step</th>
+              <th>Nama Langkah</th>
+              <th>Tipe Aksi</th>
+              <th>Daya (%)</th>
+              <th>Durasi</th>
+              <th>Target Kedalaman</th>
+              <th>Status Eksekusi</th>
+            </tr>
+          </thead>
+          <tbody id="missionTableBody">
+            <!-- Rendered via JS -->
+          </tbody>
+        </table>
+      </div>
+
+      <!-- COLLAPSIBLE JSON VIEWER -->
+      <details style="font-size:12px;color:var(--muted)">
+        <summary style="cursor:pointer;font-family:var(--mono);font-weight:600;color:var(--accent);margin-bottom:6px">
+          📝 Tampilkan Payload Raw JSON (/jalur.json)
+        </summary>
+        <pre id="rawJsonBox" style="background:#05080b;border:1px solid var(--line-soft);border-radius:var(--r-m);padding:var(--s3);font-family:var(--mono);font-size:11px;overflow-x:auto;color:var(--muted);max-height:180px"></pre>
+      </details>
+    </section>
+
+    <!-- ============================================================
+         SEKSI 07 · TERMINAL KONSOL HARDWARE
+         ============================================================ -->
+    <section class="card col-span-full" aria-label="Terminal Konsol Hardware">
+      <div class="card-header">
+        <h2><span class="sec-num">07</span> Terminal Konsol Hardware (COM4 @ 115200)</h2>
+        <div style="display:flex;gap:12px;align-items:center">
+          <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="autoScrollCheck" checked> Auto-scroll
+          </label>
+          <button class="btn-secondary btn-sm" onclick="clearTerminalLogs()">Bersihkan</button>
+        </div>
+      </div>
+
+      <!-- QUICK COMMAND PILLS -->
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="preset-pill" onclick="sendCliCommand('status')">status</button>
+        <button class="preset-pill" onclick="sendCliCommand('thrusters')">thrusters</button>
+        <button class="preset-pill" onclick="sendCliCommand('sensor')">sensor</button>
+        <button class="preset-pill" onclick="sendCliCommand('autorun status')">autorun status</button>
+        <button class="preset-pill" onclick="sendCliCommand('jalur')">jalur</button>
+        <button class="preset-pill" onclick="sendCliCommand('pid on')">pid on</button>
+        <button class="preset-pill" onclick="sendCliCommand('pid off')">pid off</button>
+        <button class="preset-pill" onclick="sendCliCommand('help')">help</button>
+        <button class="preset-pill" onclick="sendCliCommand('save')">save</button>
+      </div>
+
+      <!-- TERMINAL OUTPUT BOX -->
+      <div class="terminal-box" id="terminalOutput">
+        <!-- Log lines streamed via JS -->
+      </div>
+
+      <!-- INPUT COMMAND BAR -->
+      <div style="display:flex;gap:10px">
+        <input type="text" id="cliInput" class="input-text" style="flex:1;font-family:var(--mono);padding:var(--s2) var(--s3)" 
+               placeholder="Ketik perintah CLI firmware (contoh: status, limit 25, tes 1 15, pid on)..." 
+               onkeydown="handleCliKeyDown(event)"
+               aria-label="Perintah CLI firmware">
+        <button class="btn-primary" onclick="submitCliInput()">Kirim</button>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- FOOTER -->
+  <footer>
+    <span>AUV SAUVC 2027 · Pusat Kontrol &amp; Konfigurasi RP2040 Pico W</span>
+    <span>Universitas Bangka Belitung · 6 thruster vektor · Netral 1500 µs</span>
+  </footer>
+
+  <!-- ============================================================
+       JAVASCRIPT DASHBOARD CONTROLLER
+       ============================================================ -->
+  <script>
+    // State caches
+    let globalConfig = null;
+    let globalSensors = null;
+    let globalMission = null;
+    let activeTestPower = 15;
+    let knownLogCount = 0;
+    let cliHistory = [];
+    let cliHistoryIndex = -1;
+
+    // Toast helper
+    function showToast(message, type = "info") {
+      const container = document.getElementById("toastContainer");
+      if (!container) return;
+      const toast = document.createElement("div");
+      toast.className = `toast ${type}`;
+      const icon = type === "success" ? "✅" : (type === "error" ? "❌" : (type === "warning" ? "⚠️" : "ℹ️"));
+      toast.innerHTML = `<span style="font-size: 14px;">${icon}</span><span>${message}</span>`;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = "0";
+        toast.style.transform = "translateX(100%)";
+        setTimeout(() => toast.remove(), 350);
+      }, 3500);
+    }
+
+    // Power selector for tests
+    function setTestPower(pwr) {
+      activeTestPower = pwr;
+      document.querySelectorAll(".preset-pill-group .preset-pill").forEach(p => {
+        p.classList.toggle("active", p.innerText.trim() === `${pwr}%`);
+      });
+      const lbl = document.getElementById("lblTestPwr");
+      if (lbl) lbl.innerText = `${pwr}%`;
+    }
+
+    function getActiveTestPower() {
+      return activeTestPower;
+    }
+
+    // Power Limit Slider UX
+    function onPowerLimitInput(val) {
+      const v = Math.max(1, Math.min(100, parseInt(val) || 25));
+      const s = document.getElementById("powerLimitSlider");
+      const n = document.getElementById("powerLimitNum");
+      const badge = document.getElementById("limitBadge");
+      const warn = document.getElementById("powerLimitWarning");
+
+      if (s) s.value = v;
+      if (n) n.value = v;
+      if (badge) {
+        badge.innerText = `${v}%`;
+        if (v <= 25) {
+          badge.className = "card-badge badge-green";
+          if (warn) {
+            warn.style.color = "var(--success)";
+            warn.innerHTML = "✅ Batas 25% aktif: Sangat aman untuk pengujian bangku (mencegah overheat dan sentakan mekanis).";
+          }
+        } else if (v <= 50) {
+          badge.className = "card-badge badge-yellow";
+          if (warn) {
+            warn.style.color = "var(--warning)";
+            warn.innerHTML = "⚠️ PERINGATAN: Batas daya dinaikkan (" + v + "%). Hanya gunakan jika thruster terpasang kokoh atau saat uji di air.";
+          }
+        } else {
+          badge.className = "card-badge badge-red";
+          if (warn) {
+            warn.style.color = "var(--danger)";
+            warn.innerHTML = "🚨 BAHAYA TINGGI: Daya di atas 50% (" + v + "%). Risiko kerusakan motor/mount jika dijalankan di udara!";
+          }
+        }
+      }
+    }
+
+    async function applyPowerLimit() {
+      const val = parseInt(document.getElementById("powerLimitNum").value) || 25;
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "limit", value: val })
+        });
+        const data = await resp.json();
+        showToast(`Batas daya berhasil diset ke ${val}%.`, "success");
+      } catch (e) {
+        showToast(`Gagal mengatur limit: ${e}`, "error");
+      }
+    }
+
+    // Maneuver Shortcut Handler
+    async function triggerManeuver(action) {
+      try {
+        const pwr = getActiveTestPower();
+        const resp = await fetch("/api/maneuver", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action, power: pwr })
+        });
+        const data = await resp.json();
+        if (action === "stop") {
+          showToast("🛑 EMERGENCY STOP TERKIRIM: Semua thruster dinetralkan (1500us)!", "warning");
+        } else {
+          showToast(`Manuver '${action.toUpperCase()}' (${pwr}%) terkirim!`, "info");
+        }
+      } catch (e) {
+        showToast(`Gagal mengirim manuver: ${e}`, "error");
+      }
+    }
+
+    // Individual Thruster Test Handler
+    async function triggerTestMotor(motorId, powerPercent) {
+      try {
+        const resp = await fetch("/api/test_motor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: motorId, power: powerPercent })
+        });
+        const data = await resp.json();
+        if (motorId === 0) {
+          showToast(`Menguji SEMUA 6 Motor pada ${powerPercent}% selama 2.0 detik.`, "info");
+        } else {
+          showToast(`Uji Motor T${motorId} (${powerPercent}%) selama 2.0s.`, "info");
+        }
+      } catch (e) {
+        showToast(`Gagal mengirim uji motor: ${e}`, "error");
+      }
+    }
+
+    // Autonomous Mission Trigger
+    async function triggerMission(action) {
+      try {
+        const resp = await fetch("/api/mission_action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action })
+        });
+        const data = await resp.json();
+        if (action === "run") {
+          showToast("Misi dimulai dengan countdown 10 detik dan zero tare!", "success");
+        } else if (action === "run_now") {
+          showToast("RUN NOW: Robot langsung arming & mulai menyelam!", "warning");
+        } else {
+          showToast("Misi dihentikan.", "info");
+        }
+      } catch (e) {
+        showToast(`Gagal memicu misi: ${e}`, "error");
+      }
+    }
+
+    // Master PID Toggle
+    async function togglePidMaster(enabled) {
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "pid_state", enabled: enabled })
+        });
+        showToast(`Stabilisasi PID: ${enabled ? 'AKTIF (ARMED)' : 'NONAKTIF (DISARMED)'}`, enabled ? "success" : "warning");
+      } catch (e) {
+        showToast(`Gagal mengubah status PID: ${e}`, "error");
+      }
+    }
+
+    // Apply PID Gains per Axis
+    async function applyPidAxis(axis) {
+      let kp = 0, ki = 0, kd = 0;
+      if (axis === "roll") {
+        kp = parseFloat(document.getElementById("rollKp").value) || 0;
+        ki = parseFloat(document.getElementById("rollKi").value) || 0;
+        kd = parseFloat(document.getElementById("rollKd").value) || 0;
+      } else if (axis === "pitch") {
+        kp = parseFloat(document.getElementById("pitchKp").value) || 0;
+        ki = parseFloat(document.getElementById("pitchKi").value) || 0;
+        kd = parseFloat(document.getElementById("pitchKd").value) || 0;
+      } else if (axis === "depth") {
+        kp = parseFloat(document.getElementById("depthKp").value) || 0;
+        ki = parseFloat(document.getElementById("depthKi").value) || 0;
+        kd = parseFloat(document.getElementById("depthKd").value) || 0;
+      }
+
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "pid", axis: axis, kp: kp, ki: ki, kd: kd })
+        });
+        showToast(`Gains PID ${axis.toUpperCase()} diterapkan: Kp=${kp}, Ki=${ki}, Kd=${kd}`, "success");
+      } catch (e) {
+        showToast(`Gagal memperbarui PID ${axis}: ${e}`, "error");
+      }
+    }
+
+    function loadPidPreset(preset) {
+      if (preset === "bench") {
+        document.getElementById("rollKp").value = "0.80";
+        document.getElementById("rollKi").value = "0.000";
+        document.getElementById("rollKd").value = "0.008";
+        document.getElementById("pitchKp").value = "0.80";
+        document.getElementById("pitchKi").value = "0.000";
+        document.getElementById("pitchKd").value = "0.008";
+        document.getElementById("depthKp").value = "0.60";
+        document.getElementById("depthKi").value = "0.000";
+        document.getElementById("depthKd").value = "0.015";
+        showToast("Preset Bench Safe dimuat. Silakan klik 'Terapkan' pada masing-masing axis.", "info");
+      } else {
+        document.getElementById("rollKp").value = "0.80";
+        document.getElementById("rollKi").value = "0.000";
+        document.getElementById("rollKd").value = "0.008";
+        document.getElementById("pitchKp").value = "0.80";
+        document.getElementById("pitchKi").value = "0.000";
+        document.getElementById("pitchKd").value = "0.008";
+        document.getElementById("depthKp").value = "0.60";
+        document.getElementById("depthKi").value = "0.000";
+        document.getElementById("depthKd").value = "0.015";
+        showToast("Preset Default EEPROM dimuat. Silakan klik 'Terapkan'.", "info");
+      }
+    }
+
+    async function updateThrusterConfig(id) {
+      const revToggle = document.getElementById(`tRevToggle_${id}`);
+      const trimInput = document.getElementById(`tTrimInput_${id}`);
+      const revChecked = revToggle ? revToggle.checked : false;
+      const trimVal = trimInput ? (parseFloat(trimInput.value) || 1.0) : 1.0;
+
+      try {
+        await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "thruster", id: id, prop: "reverse", value: revChecked ? 1 : 0 })
+        });
+        await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "thruster", id: id, prop: "trim", value: trimVal })
+        });
+        showToast(`Konfigurasi T${id} diperbarui: Rev=${revChecked ? 1 : 0}, Trim=${trimVal}x`, "success");
+      } catch (e) {
+        showToast(`Gagal update T${id}: ${e}`, "error");
+      }
+    }
+
+    async function applyHandednessPreset() {
+      // Standard: T1=1, T2=1, T3=0, T4=0, T5=0, T6=1
+      const presetRev = [1, 1, 0, 0, 0, 1];
+      for (let i = 1; i <= 6; i++) {
+        const isRev = presetRev[i - 1] === 1;
+        const toggle = document.getElementById(`tRevToggle_${i}`);
+        if (toggle) toggle.checked = isRev;
+        await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "thruster", id: i, prop: "reverse", value: isRev ? 1 : 0 })
+        });
+      }
+      showToast("Standar handedness baling-baling UBB berhasil diterapkan ke semua motor!", "success");
+    }
+
+    // Auto-Run Config
+    async function applyAutoRunConfig() {
+      const en = document.getElementById("autorunToggle").checked;
+      const delay = parseInt(document.getElementById("autorunDelayNum").value) || 10;
+      try {
+        await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "autorun", enabled: en, delay: delay })
+        });
+        showToast(`Auto-Run diset: ${en ? 'AKTIF' : 'NONAKTIF'}, Delay: ${delay}s`, "success");
+      } catch (e) {
+        showToast(`Gagal set auto-run: ${e}`, "error");
+      }
+    }
+
+    // Calibration Handlers
+    async function triggerCalib(target) {
+      let payload = { type: "calib", target: target };
+      if (target === "zero") {
+        const mbar = document.getElementById("manualZeroPres").value;
+        if (mbar && mbar.trim()) payload.mbar = parseFloat(mbar);
+      } else if (target === "level") {
+        const p = document.getElementById("manualPitchOff").value;
+        const r = document.getElementById("manualRollOff").value;
+        if (p && r && p.trim() && r.trim()) {
+          payload.pitch = parseFloat(p);
+          payload.roll = parseFloat(r);
+        }
+      }
+
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (target === "zero") {
+          showToast(`Kalibrasi Nol Kedalaman Berhasil! Ref: ${data.calib ? data.calib.depth_zero_pressure.toFixed(1) : ''} mbar`, "success");
+        } else {
+          showToast(`Leveling IMU Berhasil! Pitch: ${data.calib ? data.calib.pitch_offset.toFixed(2) : ''}°, Roll: ${data.calib ? data.calib.roll_offset.toFixed(2) : ''}°`, "success");
+        }
+      } catch (e) {
+        showToast(`Gagal kalibrasi: ${e}`, "error");
+      }
+    }
+
+    // EEPROM Commit
+    async function commitSaveEEPROM() {
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "save" })
+        });
+        showToast("💾 Pengaturan berhasil disimpan permanen ke EEPROM Flash RP2040!", "success");
+      } catch (e) {
+        showToast(`Gagal menyimpan ke EEPROM: ${e}`, "error");
+      }
+    }
+
+    // Factory Defaults Reset
+    async function resetFactoryDefaults() {
+      if (!confirm("Apakah Anda yakin ingin mengembalikan seluruh parameter RAM ke default pabrik?")) return;
+      try {
+        const resp = await fetch("/api/param_update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "default" })
+        });
+        showToast("Pengaturan dikembalikan ke Default Pabrik Firmware di RAM.", "warning");
+      } catch (e) {
+        showToast(`Gagal reset default: ${e}`, "error");
+      }
+    }
+
+    // Mission Reload
+    async function reloadJalurServer() {
+      try {
+        const resp = await fetch("/api/mission_reload", { method: "POST" });
+        const data = await resp.json();
+        showToast("Rute /jalur.json berhasil dimuat ulang dari server!", "success");
+        renderMissionTable(data.mission);
+      } catch (e) {
+        showToast(`Gagal memuat ulang jalur: ${e}`, "error");
+      }
+    }
+
+    // CLI Interactive Terminal Handlers
+    async function sendCliCommand(cmd) {
+      if (!cmd || !cmd.trim()) return;
+      try {
+        await fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: cmd })
+        });
+      } catch (e) {
+        showToast(`Gagal mengirim perintah: ${e}`, "error");
+      }
+    }
+
+    function submitCliInput() {
+      const inp = document.getElementById("cliInput");
+      const cmd = inp.value.trim();
+      if (!cmd) return;
+      cliHistory.push(cmd);
+      cliHistoryIndex = cliHistory.length;
+      sendCliCommand(cmd);
+      inp.value = "";
+    }
+
+    function handleCliKeyDown(event) {
+      if (event.key === "Enter") {
+        submitCliInput();
+      } else if (event.key === "ArrowUp") {
+        if (cliHistoryIndex > 0) {
+          cliHistoryIndex--;
+          document.getElementById("cliInput").value = cliHistory[cliHistoryIndex];
+        }
+      } else if (event.key === "ArrowDown") {
+        if (cliHistoryIndex < cliHistory.length - 1) {
+          cliHistoryIndex++;
+          document.getElementById("cliInput").value = cliHistory[cliHistoryIndex];
+        } else {
+          cliHistoryIndex = cliHistory.length;
+          document.getElementById("cliInput").value = "";
+        }
+      }
+    }
+
+    function clearTerminalLogs() {
+      document.getElementById("terminalOutput").innerHTML = "";
+    }
+
+    // Render Thruster Config Table
+    function renderThrusterTable(thrusters) {
+      const tbody = document.getElementById("thrusterConfigBody");
+      if (!tbody || !thrusters) return;
+
+      if (tbody.children.length === thrusters.length) return;
+
+      tbody.innerHTML = "";
+      thrusters.forEach(t => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td style="font-weight: 700; font-family: var(--mono); color: var(--accent);">T${t.id}</td>
+          <td><b>${t.pos || 'Motor ' + t.id}</b></td>
+          <td style="font-family: var(--mono); color: var(--muted);">GP${t.pin}</td>
+          <td>
+            <div style="display:flex;align-items:center;gap:8px">
+              <label class="switch">
+                <input type="checkbox" id="tRevToggle_${t.id}" ${t.reverse ? 'checked' : ''}>
+                <span class="slider-toggle"></span>
+              </label>
+              <span style="font-size: 11px; font-family: var(--mono); color: var(--muted);" id="tRevLabel_${t.id}">
+                ${t.reverse ? 'Terbalik (1)' : 'Normal (0)'}
+              </span>
+            </div>
+          </td>
+          <td>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input type="range" min="0.10" max="2.50" step="0.05" value="${t.trim.toFixed(2)}" style="width: 100px;"
+                     oninput="document.getElementById('tTrimInput_${t.id}').value = parseFloat(this.value).toFixed(2)">
+              <input type="number" id="tTrimInput_${t.id}" min="0.10" max="2.50" step="0.05" value="${t.trim.toFixed(2)}" 
+                     class="input-number" style="width: 64px;">
+              <span style="font-size: 11px; color: var(--muted);">x</span>
+            </div>
+          </td>
+          <td>
+            <button class="btn-secondary btn-sm" onclick="updateThrusterConfig(${t.id})">
+              Update T${t.id}
+            </button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+
+        const revTog = tr.querySelector(`#tRevToggle_${t.id}`);
+        if (revTog) {
+          revTog.addEventListener("change", (e) => {
+            const lbl = document.getElementById(`tRevLabel_${t.id}`);
+            if (lbl) lbl.innerText = e.target.checked ? "Terbalik (1)" : "Normal (0)";
+          });
+        }
+      });
+    }
+
+    // Render Mission Table
+    function renderMissionTable(mission) {
+      const tbody = document.getElementById("missionTableBody");
+      const rawBox = document.getElementById("rawJsonBox");
+      if (!tbody || !mission || !mission.steps) return;
+
+      if (rawBox) rawBox.innerText = JSON.stringify(mission.steps, null, 2);
+
+      tbody.innerHTML = "";
+      mission.steps.forEach((s, idx) => {
+        const stepNum = s.step || (idx + 1);
+        const isActive = (mission.state === "RUNNING" && mission.current_step === stepNum);
+        const tr = document.createElement("tr");
+        if (isActive) tr.className = "active-step";
+
+        tr.innerHTML = `
+          <td style="font-weight: 700; font-family: var(--mono);">#${stepNum}</td>
+          <td><b>${s.name || 'Langkah ' + stepNum}</b></td>
+          <td><span class="card-badge badge-cyan">${s.action || 'IDLE'}</span></td>
+          <td style="font-family: var(--mono);">${s.power || 0}%</td>
+          <td style="font-family: var(--mono);">${s.duration || 0}s</td>
+          <td style="font-family: var(--mono); color: var(--info);">${s.target_cm > 0 ? s.target_cm + ' cm' : '-'}</td>
+          <td>
+            ${isActive 
+              ? '<span class="card-badge badge-green" style="animation: pulse 1s infinite;">SEDANG BERJALAN (' + (mission.elapsed_sec || 0) + 's)</span>' 
+              : (mission.current_step > stepNum ? '<span class="card-badge badge-cyan">SELESAI</span>' : '<span style="color:var(--faint);font-family:var(--mono);font-size:11px;">Menunggu</span>')}
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    // Main Update State Loop (5 Hz)
+    async function updateDashboard() {
+      try {
+        const resp = await fetch("/api/config_state");
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        // 1. Connection pill
+        const dot = document.getElementById("hwDot");
+        const statusText = document.getElementById("hwStatusText");
+        const hzBadge = document.getElementById("hzBadge");
+
+        if (dot && statusText) {
+          if (data.connected) {
+            dot.className = "dot-pulse";
+            statusText.innerText = `ONLINE (${data.port} @ ${data.baud})`;
+            statusText.style.color = "var(--success)";
+          } else {
+            dot.className = "dot-pulse offline";
+            statusText.innerText = `OFFLINE / SIMULASI (${data.port})`;
+            statusText.style.color = "var(--danger)";
+          }
+        }
+        if (hzBadge) {
+          hzBadge.innerText = `${(data.rate_hz || 0).toFixed(1)} Hz`;
+        }
+
+        // 2. Sensor Gauges
+        if (data.sensors) {
+          const vd = document.getElementById("valDepth");
+          const vp = document.getElementById("valPressure");
+          const vpt = document.getElementById("valPitch");
+          const vr = document.getElementById("valRoll");
+          const vt = document.getElementById("valTemp");
+
+          if (vd) vd.innerText = data.sensors.depth_cm.toFixed(1);
+          if (vp) vp.innerText = data.sensors.pressure_mbar.toFixed(1);
+          if (vpt) vpt.innerText = (data.sensors.pitch >= 0 ? "+" : "") + data.sensors.pitch.toFixed(1);
+          if (vr) vr.innerText = (data.sensors.roll >= 0 ? "+" : "") + data.sensors.roll.toFixed(1);
+          if (vt) vt.innerText = (data.sensors.temp_c || 28.5).toFixed(1);
+
+          // Visual levels
+          const dFill = document.getElementById("depthGaugeFill");
+          if (dFill) dFill.style.width = Math.min(100, (data.sensors.depth_cm / 140.0) * 100) + "%";
+
+          const rHorizon = document.getElementById("rollHorizonFill");
+          if (rHorizon) {
+            const rNorm = Math.max(-45, Math.min(45, data.sensors.roll));
+            if (rNorm >= 0) {
+              rHorizon.style.left = "50%";
+              rHorizon.style.width = ((rNorm / 45.0) * 50) + "%";
+              rHorizon.style.backgroundColor = "var(--info)";
+            } else {
+              const w = (Math.abs(rNorm) / 45.0) * 50;
+              rHorizon.style.left = (50 - w) + "%";
+              rHorizon.style.width = w + "%";
+              rHorizon.style.backgroundColor = "var(--warning)";
+            }
+          }
+
+          const pHorizon = document.getElementById("pitchHorizonFill");
+          if (pHorizon) {
+            const pNorm = Math.max(-45, Math.min(45, data.sensors.pitch));
+            if (pNorm >= 0) {
+              pHorizon.style.left = "50%";
+              pHorizon.style.width = ((pNorm / 45.0) * 50) + "%";
+              pHorizon.style.backgroundColor = "#a78bfa";
+            } else {
+              const w = (Math.abs(pNorm) / 45.0) * 50;
+              pHorizon.style.left = (50 - w) + "%";
+              pHorizon.style.width = w + "%";
+              pHorizon.style.backgroundColor = "var(--danger)";
+            }
+          }
+        }
+
+        // 3. Thruster Live Cards (T1..T6)
+        if (data.pulses) {
+          for (let i = 0; i < 6; i++) {
+            const pulse = data.pulses[i];
+            const deltaPwr = data.deltas ? data.deltas[i] : ((pulse - 1500) / 5.0);
+            const id = i + 1;
+
+            const pEl = document.getElementById(`tpulse${id}`);
+            const pwrEl = document.getElementById(`tpwr${id}`);
+            const dirEl = document.getElementById(`tdir${id}`);
+            const fillEl = document.getElementById(`tfill${id}`);
+            const cardEl = document.getElementById(`tcard${id}`);
+
+            if (pEl) pEl.innerText = `${pulse} µs`;
+            if (pwrEl) {
+              pwrEl.innerText = `${(deltaPwr >= 0 ? "+" : "") + deltaPwr.toFixed(1)}%`;
+              pwrEl.className = `thruster-pwr-badge ${deltaPwr > 0.5 ? 'pwr-pos' : (deltaPwr < -0.5 ? 'pwr-neg' : 'pwr-zero')}`;
+            }
+
+            if (cardEl) {
+              if (Math.abs(deltaPwr) > 0.5) cardEl.classList.add("active");
+              else cardEl.classList.remove("active");
+            }
+
+            if (dirEl) {
+              if (Math.abs(deltaPwr) <= 0.5) {
+                dirEl.innerText = "NETRAL";
+                dirEl.style.color = "var(--faint)";
+              } else if (deltaPwr > 0) {
+                dirEl.innerText = id >= 5 ? "TURUN / SELAM" : "MAJU (CW)";
+                dirEl.style.color = "var(--success)";
+              } else {
+                dirEl.innerText = id >= 5 ? "NAIK / SURFACE" : "MUNDUR (CCW)";
+                dirEl.style.color = "var(--danger)";
+              }
+            }
+
+            if (fillEl) {
+              const frac = Math.max(-1.0, Math.min(1.0, (pulse - 1500) / 500.0));
+              if (frac >= 0) {
+                fillEl.style.left = "50%";
+                fillEl.style.width = (frac * 50) + "%";
+                fillEl.style.backgroundColor = "var(--accent)";
+              } else {
+                const w = Math.abs(frac) * 50;
+                fillEl.style.left = (50 - w) + "%";
+                fillEl.style.width = w + "%";
+                fillEl.style.backgroundColor = "var(--danger)";
+              }
+            }
+          }
+        }
+
+        // 4. Mission state & targets
+        if (data.mission) {
+          globalMission = data.mission;
+          const fsmBadge = document.getElementById("fsmBadge");
+          if (fsmBadge) {
+            fsmBadge.innerText = `STATE: ${data.mission.state}`;
+            if (data.mission.state === "RUNNING") fsmBadge.className = "card-badge badge-green";
+            else if (data.mission.state === "COUNTDOWN") fsmBadge.className = "card-badge badge-yellow";
+            else if (data.mission.state === "COMPLETED") fsmBadge.className = "card-badge badge-purple";
+            else fsmBadge.className = "card-badge badge-cyan";
+          }
+
+          const targetDepth = document.getElementById("targetDepthText");
+          if (targetDepth && data.mission.target_depth_cm !== undefined) {
+            targetDepth.innerText = `Target: ${data.mission.target_depth_cm.toFixed(1)} cm`;
+          }
+
+          renderMissionTable(data.mission);
+        }
+
+        // 5. Config sync (inputs update only when user is not actively typing)
+        if (data.config) {
+          globalConfig = data.config;
+          const activeEl = document.activeElement;
+
+          // Power Limit
+          if (activeEl?.id !== "powerLimitSlider" && activeEl?.id !== "powerLimitNum") {
+            onPowerLimitInput(data.config.power_limit);
+          }
+
+          // PID Master Toggle
+          const pidHeaderBadge = document.getElementById("pidHeaderBadge");
+          const pidMasterToggle = document.getElementById("pidMasterToggle");
+          const pidMasterStatus = document.getElementById("pidMasterStatus");
+
+          if (pidHeaderBadge) {
+            pidHeaderBadge.innerText = `PID: ${data.config.pid_enabled ? 'ON' : 'OFF'}`;
+            pidHeaderBadge.className = `card-badge ${data.config.pid_enabled ? 'badge-green' : 'badge-yellow'}`;
+          }
+          if (pidMasterToggle) pidMasterToggle.checked = !!data.config.pid_enabled;
+          if (pidMasterStatus) {
+            pidMasterStatus.innerText = data.config.pid_enabled ? "PID AKTIF & ARMED" : "PID NONAKTIF";
+            pidMasterStatus.style.color = data.config.pid_enabled ? "var(--success)" : "var(--warning)";
+          }
+
+          // PID Gains
+          if (data.config.pid) {
+            if (activeEl?.id !== "rollKp" && activeEl?.id !== "rollKi" && activeEl?.id !== "rollKd") {
+              if (data.config.pid.roll) {
+                const elKp = document.getElementById("rollKp");
+                const elKi = document.getElementById("rollKi");
+                const elKd = document.getElementById("rollKd");
+                if (elKp) elKp.value = data.config.pid.roll.kp.toFixed(2);
+                if (elKi) elKi.value = data.config.pid.roll.ki.toFixed(3);
+                if (elKd) elKd.value = data.config.pid.roll.kd.toFixed(3);
+              }
+            }
+            if (activeEl?.id !== "pitchKp" && activeEl?.id !== "pitchKi" && activeEl?.id !== "pitchKd") {
+              if (data.config.pid.pitch) {
+                const elKp = document.getElementById("pitchKp");
+                const elKi = document.getElementById("pitchKi");
+                const elKd = document.getElementById("pitchKd");
+                if (elKp) elKp.value = data.config.pid.pitch.kp.toFixed(2);
+                if (elKi) elKi.value = data.config.pid.pitch.ki.toFixed(3);
+                if (elKd) elKd.value = data.config.pid.pitch.kd.toFixed(3);
+              }
+            }
+            if (activeEl?.id !== "depthKp" && activeEl?.id !== "depthKi" && activeEl?.id !== "depthKd") {
+              if (data.config.pid.depth) {
+                const elKp = document.getElementById("depthKp");
+                const elKi = document.getElementById("depthKi");
+                const elKd = document.getElementById("depthKd");
+                if (elKp) elKp.value = data.config.pid.depth.kp.toFixed(2);
+                if (elKi) elKi.value = data.config.pid.depth.ki.toFixed(3);
+                if (elKd) elKd.value = data.config.pid.depth.kd.toFixed(3);
+              }
+            }
+          }
+
+          // Thruster Table
+          if (data.config.thrusters) {
+            renderThrusterTable(data.config.thrusters);
+          }
+
+          // Auto-Run
+          if (data.config.autorun) {
+            if (activeEl?.id !== "autorunToggle" && activeEl?.id !== "autorunDelaySlider" && activeEl?.id !== "autorunDelayNum") {
+              const elTog = document.getElementById("autorunToggle");
+              const elSld = document.getElementById("autorunDelaySlider");
+              const elNum = document.getElementById("autorunDelayNum");
+              if (elTog) elTog.checked = !!data.config.autorun.enabled;
+              if (elSld) elSld.value = data.config.autorun.delay;
+              if (elNum) elNum.value = data.config.autorun.delay;
+            }
+          }
+
+          // Calibration badges
+          if (data.config.calib) {
+            const zPill = document.getElementById("calibZeroPill");
+            if (zPill) {
+              if (data.config.calib.depth_zero_calibrated) {
+                zPill.innerText = "TERKALIBRASI";
+                zPill.className = "card-badge badge-green";
+              } else {
+                zPill.innerText = "TARE PENDING";
+                zPill.className = "card-badge badge-yellow";
+              }
+            }
+
+            const zeroRef = document.getElementById("zeroRefText");
+            if (zeroRef) {
+              zeroRef.innerText = `Ref Nol: ${(data.config.calib.depth_zero_pressure || 1013.25).toFixed(1)} mbar`;
+            }
+
+            const pOff = document.getElementById("pitchOffText");
+            if (pOff) pOff.innerText = `Level Trim: ${(data.config.calib.pitch_offset || 0).toFixed(2)}°`;
+
+            const rOff = document.getElementById("rollOffText");
+            if (rOff) rOff.innerText = `Level Trim: ${(data.config.calib.roll_offset || 0).toFixed(2)}°`;
+
+            const lastBadge = document.getElementById("calibLastTimeBadge");
+            if (lastBadge && data.config.calib.last_calib_time) {
+              lastBadge.innerText = `TERAKHIR: ${data.config.calib.last_calib_time}`;
+            }
+          }
+        }
+
+      } catch (e) {
+        console.warn("Poll state error:", e);
+      }
+    }
+
+    // Separate Fast Poll for Terminal Logs
+    async function updateTerminalLogs() {
+      try {
+        const resp = await fetch("/api/state");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.logs && data.logs.length > knownLogCount) {
+          const term = document.getElementById("terminalOutput");
+          const autoScrollEl = document.getElementById("autoScrollCheck");
+          const shouldScroll = autoScrollEl ? autoScrollEl.checked : true;
+
+          for (let i = knownLogCount; i < data.logs.length; i++) {
+            const raw = data.logs[i];
+            const div = document.createElement("div");
+            div.className = "term-line";
+
+            if (raw.includes(">>>")) div.className += " cmd";
+            else if (raw.includes("OK:") || raw.includes("SUCCESS")) div.className += " resp-ok";
+            else if (raw.includes("WARNING") || raw.includes("CAUTION")) div.className += " resp-warn";
+            else if (raw.includes("ERROR") || raw.includes("EMERGENCY")) div.className += " resp-err";
+            else if (raw.includes("[STATUS]") || raw.includes("[THRUSTERS]")) div.className += " resp-status";
+            else div.className += " resp-dim";
+
+            div.innerText = raw;
+            term.appendChild(div);
+          }
+          knownLogCount = data.logs.length;
+          if (shouldScroll) {
+            term.scrollTop = term.scrollHeight;
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // Start polling loops
+    window.addEventListener("DOMContentLoaded", () => {
+      updateDashboard();
+      updateTerminalLogs();
+      setInterval(updateDashboard, 200);   // 5 Hz main state
+      setInterval(updateTerminalLogs, 300); // 3.3 Hz terminal stream
+    });
+  </script>
+</body>
+</html>

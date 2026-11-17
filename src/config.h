@@ -8,7 +8,7 @@
 namespace Config {
 
 constexpr uint32_t CONFIG_MAGIC = 0x41555631;  // 'AUV1'
-constexpr uint8_t CONFIG_VERSION = 4;
+constexpr uint8_t CONFIG_VERSION = 6;
 constexpr size_t THRUSTER_COUNT = 6;
 constexpr size_t AXIS_COUNT = 6;  // Surge, Sway, Heave, Yaw, Pitch, Roll
 
@@ -23,12 +23,19 @@ constexpr uint16_t DEFAULT_PULSE_MIN_US = 1000;
 constexpr uint16_t DEFAULT_PULSE_NEUTRAL_US = 1500;
 constexpr uint16_t DEFAULT_PULSE_MAX_US = 2000;
 
-// Direction Polarity: T1, T2 (CW) = 1; T3, T4 (CCW) = 0; T5 (CCW) = 1; T6 (CW) = 0
-constexpr uint8_t DEFAULT_THRUSTER_REVERSE[THRUSTER_COUNT] = {1, 1, 0, 0, 1, 0};
+// Direction Polarity: T1, T2 (CW) = 1; T3, T4 (CCW) = 0; T5 (CW dive) = 0; T6 (CCW dive) = 1
+constexpr uint8_t DEFAULT_THRUSTER_REVERSE[THRUSTER_COUNT] = {1, 1, 0, 0, 0, 1};
 constexpr float DEFAULT_THRUSTER_TRIM[THRUSTER_COUNT] = {1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f};
 
-// Safety Limits
+// Safety Limits & ESC Deadband
 constexpr uint8_t DEFAULT_POWER_LIMIT_PERCENT = 25;  // Default 25% safety cap for bench testing
+constexpr uint16_t DEFAULT_ESC_DEADBAND_US = 25;    // ESC deadband in microseconds (0-80)
+constexpr float DEFAULT_DIFF_HORIZ_TRIM = 0.0f;     // Differential trim Port (T1, T3) vs Starboard (T2, T4) (-20 to +20%)
+constexpr float DEFAULT_DIFF_VERT_TRIM = 0.0f;      // Differential trim T5 vs T6 (-20 to +20%)
+
+// Auto-Run Timing Defaults
+constexpr uint8_t DEFAULT_AUTORUN_TARE_SEC = 3;     // Surface depth tare (seconds before launch)
+constexpr uint8_t DEFAULT_AUTORUN_LEVEL_SEC = 2;    // IMU level tare (seconds before launch)
 
 // Sensor Addresses
 constexpr uint8_t MPU6050_ADDR_PRIMARY = 0x68;
@@ -98,6 +105,13 @@ struct Settings {
   // Auto-Run Configuration
   uint8_t autoRunEnabled;   // 0 = disabled, 1 = enabled on boot
   uint8_t autoRunDelaySec;  // Countdown delay (3 to 60 seconds, default 10)
+  uint8_t autoRunTareSec;   // Surface depth tare (default: 3)
+  uint8_t autoRunLevelSec;  // IMU level tare (default: 2)
+
+  // Actuator Trims & Deadband
+  uint16_t escDeadbandUs;   // ESC deadband in microseconds (0-80, default 25)
+  float diffHorizTrim;      // Differential trim Port (T1, T3) vs Starboard (T2, T4) (-20.0 to +20.0, default 0.0)
+  float diffVertTrim;       // Differential trim T5 vs T6 (-20.0 to +20.0, default 0.0)
 
   uint32_t checksum;
 };
@@ -145,8 +159,23 @@ inline void loadDefaults(Settings& s) {
 
   s.autoRunEnabled = 0;
   s.autoRunDelaySec = 10;
+  s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
+  s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+
+  s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
+  s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
+  s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
 
   s.checksum = calculateChecksum(s);
+}
+
+inline bool saveSettings(Settings& s) {
+  s.magic = CONFIG_MAGIC;
+  s.version = CONFIG_VERSION;
+  s.checksum = calculateChecksum(s);
+  EEPROM.begin(sizeof(Settings));
+  EEPROM.put(0, s);
+  return EEPROM.commit();
 }
 
 inline bool loadSettings(Settings& s) {
@@ -164,8 +193,23 @@ inline bool loadSettings(Settings& s) {
     if (s.autoRunDelaySec < 3 || s.autoRunDelaySec > 60) {
       s.autoRunDelaySec = 10;
     }
+    if (s.autoRunTareSec < 1 || s.autoRunTareSec > 30) {
+      s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
+    }
+    if (s.autoRunLevelSec < 1 || s.autoRunLevelSec > 30) {
+      s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+    }
     if (s.autoRunEnabled > 1) {
       s.autoRunEnabled = 0;
+    }
+    if (s.escDeadbandUs > 80) {
+      s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
+    }
+    if (s.diffHorizTrim < -20.0f || s.diffHorizTrim > 20.0f) {
+      s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
+    }
+    if (s.diffVertTrim < -20.0f || s.diffVertTrim > 20.0f) {
+      s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
     }
     for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
       if (s.thrusters[i].pulseMin < 800 || s.thrusters[i].pulseMin > 1400) {
@@ -184,17 +228,35 @@ inline bool loadSettings(Settings& s) {
     return true;
   }
 
+  // Automatic EEPROM Schema Migration (v5 -> v6)
+  if (s.magic == CONFIG_MAGIC && s.version == 5) {
+    s.version = CONFIG_VERSION;
+    s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
+    s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+    s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
+    s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
+    s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
+    saveSettings(s);
+    return true;
+  }
+
+  // Automatic EEPROM Schema Migration (v4 -> v6)
+  if (s.magic == CONFIG_MAGIC && s.version == 4) {
+    s.version = CONFIG_VERSION;
+    for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
+      s.thrusters[i].reverse = DEFAULT_THRUSTER_REVERSE[i];
+    }
+    s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
+    s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+    s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
+    s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
+    s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
+    saveSettings(s);
+    return true;
+  }
+
   loadDefaults(s);
   return false;
-}
-
-inline bool saveSettings(Settings& s) {
-  s.magic = CONFIG_MAGIC;
-  s.version = CONFIG_VERSION;
-  s.checksum = calculateChecksum(s);
-  EEPROM.begin(sizeof(Settings));
-  EEPROM.put(0, s);
-  return EEPROM.commit();
 }
 
 }  // namespace Config

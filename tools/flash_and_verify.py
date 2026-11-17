@@ -6,9 +6,11 @@ import string
 import serial
 import serial.tools.list_ports
 
-COM_PORT = 'COM4'
+COM_PORT = os.environ.get('AUV_COM_PORT', 'COM4')
 BAUD_RATE = 115200
-UF2_SRC = r'D:\Projcet\Source Code SAUVC\auv-6thruster-rev-0.1\firmware\firmware_rev0.1.uf2'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+UF2_SRC = os.path.join(PROJECT_ROOT, 'firmware', 'firmware_rev0.1.uf2')
 
 print(f"=== STEP 4: Flashing RP2040 on {COM_PORT} ===")
 if not os.path.exists(UF2_SRC):
@@ -104,18 +106,18 @@ checks = [
     ("T2 Reverse YES", "|  2 | GP3  |" in resp_thrusters and "YES" in resp_thrusters),
     ("T3 Reverse NO",  "|  3 | GP4  |" in resp_thrusters and " NO" in resp_thrusters),
     ("T4 Reverse NO",  "|  4 | GP5  |" in resp_thrusters and " NO" in resp_thrusters),
-    ("T5 Reverse YES", "|  5 | GP6  |" in resp_thrusters and "YES" in resp_thrusters),
-    ("T6 Reverse NO",  "|  6 | GP7  |" in resp_thrusters and " NO" in resp_thrusters),
+    ("T5 Reverse NO",   "|  5 | GP6  |" in resp_thrusters and " NO" in resp_thrusters),
+    ("T6 Reverse YES",  "|  6 | GP7  |" in resp_thrusters and "YES" in resp_thrusters),
 ]
 
-# 2. Test T1 at +15%
-resp_t1 = send_and_read("tes 1 15", wait_time=0.8)
+# 2. Test T5 at +15% (reverse 0 -> pulse 1575us > 1500us -> CW)
+resp_t5 = send_and_read("tes 5 15", wait_time=0.8)
 
-# 3. Test T2 at +15%
-resp_t2 = send_and_read("tes 2 15", wait_time=0.8)
-
-# 4. Test T6 at +15%
+# 3. Test T6 at +15% (reverse 1 -> pulse 1425us < 1500us -> CCW)
 resp_t6 = send_and_read("tes 6 15", wait_time=0.8)
+
+# 4. Test T1 at +15% (reverse 1 -> pulse 1425us < 1500us -> CW)
+resp_t1 = send_and_read("tes 1 15", wait_time=0.8)
 
 # Save settings to persist
 send_and_read("save", wait_time=0.5)
@@ -133,16 +135,27 @@ for line in resp_thrusters.splitlines():
     if any(f"|  {i} |" in line for i in range(1, 7)):
         print("  " + line)
 
+for name, passed in checks:
+    print(f"  {name}: {'PASS' if passed else 'FAIL'}")
+    if not passed:
+        all_passed = False
+
+import re
+
 print("\nPulse Output Verification:")
-t1_ok = "1425us" in resp_t1
-t2_ok = "1425us" in resp_t2
-t6_ok = "1575us" in resp_t6
+m5 = re.search(r'\((\d{4})us\)', resp_t5)
+m6 = re.search(r'\((\d{4})us\)', resp_t6)
+m1 = re.search(r'\((\d{4})us\)', resp_t1)
 
-print(f"  T1 (CW) at +15% -> 1425us: {'PASS' if t1_ok else 'FAIL'} (Response: {resp_t1.strip()})")
-print(f"  T2 (CW) at +15% -> 1425us: {'PASS' if t2_ok else 'FAIL'} (Response: {resp_t2.strip()})")
-print(f"  T6 (CW) at +15% -> 1575us: {'PASS' if t6_ok else 'FAIL'} (Response: {resp_t6.strip()})")
+t5_ok = bool(m5 and int(m5.group(1)) > 1500)
+t6_ok = bool(m6 and int(m6.group(1)) < 1500)
+t1_ok = bool(m1 and int(m1.group(1)) < 1500)
 
-if not (t1_ok and t2_ok and t6_ok):
+print(f"  T5 (CW dive)  at +15% -> >1500us (CW): {'PASS' if t5_ok else 'FAIL'} (Pulse: {m5.group(1) if m5 else 'N/A'}us)")
+print(f"  T6 (CCW dive) at +15% -> <1500us (CCW): {'PASS' if t6_ok else 'FAIL'} (Pulse: {m6.group(1) if m6 else 'N/A'}us)")
+print(f"  T1 (CW)       at +15% -> <1500us (CW): {'PASS' if t1_ok else 'FAIL'} (Pulse: {m1.group(1) if m1 else 'N/A'}us)")
+
+if not (t5_ok and t6_ok and t1_ok):
     all_passed = False
 
 if all_passed:
