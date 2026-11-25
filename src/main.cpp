@@ -6,6 +6,7 @@
 #include "sensors.h"
 #include "mission.h"
 #include "cli.h"
+#include "wireless_config.h"
 
 namespace {
 
@@ -17,13 +18,30 @@ bool armed = false;
 bool pidEnabled = false;
 bool outputsReady = false;
 bool thrustersNeutral = true;
+bool hilModeActive = false;
+uint32_t hilLastCommandMs = 0;
+constexpr uint32_t HIL_WATCHDOG_MS = 350;
+constexpr uint16_t HIL_MAX_DELTA_US = 75;
+bool bootCalibrationPending = false;
+uint32_t bootCalibrationStartedAtMs = 0;
+uint32_t bootCalibrationLastSampleAtMs = 0;
+uint32_t bootCalibrationStableSinceMs = 0;
+uint8_t bootCalibrationStableSamples = 0;
+bool bootCalibrationHasPreviousSample = false;
+Sensors::SensorData bootCalibrationInitialSample{};
+Sensors::SensorData bootCalibrationPreviousSample{};
+constexpr uint32_t BOOT_CALIBRATION_TIMEOUT_MS = 15000;
+constexpr uint32_t BOOT_CALIBRATION_SAMPLE_INTERVAL_MS = 100;
+constexpr uint32_t BOOT_CALIBRATION_STABLE_MS = 2000;
+constexpr uint8_t BOOT_CALIBRATION_REQUIRED_SAMPLES = 20;
 
 enum class FsmState {
   IDLE,
   COUNTDOWN,
   MISSION_RUNNING,
   MISSION_DONE,
-  ABORTED
+  ABORTED,
+  BOOT_CALIBRATING
 };
 
 FsmState fsmState = FsmState::IDLE;
@@ -34,6 +52,8 @@ uint8_t countdownDurationSec = 10;
 int countdownLastSecLogged = -1;
 bool countdownTareDone = false;
 bool countdownImuDone = false;
+bool countdownTareSucceeded = false;
+bool countdownImuSucceeded = false;
 
 // Mission State
 size_t currentStepIndex = 0;
@@ -83,6 +103,10 @@ bool attachThrusters() {
     const int channel = thrusters[i].attach(t.pin, 750, 2250, t.pulseNeutral);
     if (channel < 0) {
       CLI::logError("Failed to attach thruster T%u on GP%u", static_cast<unsigned>(i + 1), t.pin);
+      for (size_t j = 0; j < i; ++j) {
+        thrusters[j].detach();
+      }
+      outputsReady = false;
       return false;
     }
     thrusters[i].writeMicroseconds(t.pulseNeutral);
@@ -146,6 +170,12 @@ bool handleStartMotorTest(uint8_t id, float powerPercent, String& message) {
     message = "ERROR: Thruster hardware outputs not ready or failed to attach.";
     return false;
   }
+  if (id > Config::THRUSTER_COUNT || !isfinite(powerPercent) ||
+      fsmState != FsmState::IDLE || pidEnabled || testUntilMs != 0 ||
+      escCalibState != EscCalibState::IDLE || armed) {
+    message = "ERROR: Motor test requires an idle, disarmed system and a valid command.";
+    return false;
+  }
 
   const float safetyLimit = static_cast<float>(settings.powerLimitPercent);
   float effPower = powerPercent;
@@ -188,11 +218,15 @@ bool handleStartMotorTest(uint8_t id, float powerPercent, String& message) {
 }
 
 void handleEmergencyStop() {
+  bootCalibrationPending = false;
+  hilModeActive = false;
   testUntilMs = 0;
   testMotorId = 0;
   escCalibState = EscCalibState::IDLE;
   pidEnabled = false;
   fsmState = FsmState::IDLE;
+  countdownTareSucceeded = false;
+  countdownImuSucceeded = false;
   armed = false;
   rollIntegral = 0.0f;
   pitchIntegral = 0.0f;
@@ -201,20 +235,39 @@ void handleEmergencyStop() {
 }
 
 bool handleStartMission(bool immediate) {
+  if (bootCalibrationPending) {
+    CLI::logWarn("Cannot start mission while automatic startup calibration is running.");
+    return false;
+  }
+  if (!outputsReady || hilModeActive) {
+    CLI::logError("Cannot start mission: outputs are not ready or HIL mode is active.");
+    return false;
+  }
   if (Mission::getStepCount() == 0) {
     CLI::logError("Cannot start mission: 0 steps loaded from /jalur.json!");
     return false;
   }
 
-  if (fsmState == FsmState::MISSION_RUNNING) {
-    CLI::logWarn("Mission already running!");
+  if (fsmState != FsmState::IDLE || armed || pidEnabled ||
+      testUntilMs != 0 || escCalibState != EscCalibState::IDLE) {
+    CLI::logWarn("Cannot start mission: system is not idle and disarmed.");
+    return false;
+  }
+
+  Sensors::SensorData sensor{};
+  Sensors::snapshot(sensor);
+  if (!sensor.imuReady || !sensor.pressureReady ||
+      sensor.sampleCount == 0 || millis() - sensor.lastUpdateMs > 500) {
+    CLI::logError("Cannot start mission: fresh IMU and depth sensor readings are required.");
     return false;
   }
 
   if (immediate || settings.autoRunDelaySec == 0) {
-    // Immediate arm and launch
-    Sensors::calibrateDepthZero(settings);
-    Sensors::calibrateImuLevel(settings);
+    if (!Sensors::calibrateDepthZero(settings) ||
+        !Sensors::calibrateImuLevel(settings) || !settings.depthZeroCalibrated) {
+      CLI::logError("Cannot start mission: depth and IMU calibration must both succeed.");
+      return false;
+    }
     fsmState = FsmState::MISSION_RUNNING;
     armed = true;
     thrustersNeutral = false;
@@ -258,6 +311,8 @@ bool handleStartMission(bool immediate) {
     countdownLastSecLogged = -1;
     countdownTareDone = false;
     countdownImuDone = false;
+    countdownTareSucceeded = false;
+    countdownImuSucceeded = false;
     CLI::logState("Launch countdown started: %u seconds. Type 'stop' to abort.", countdownDurationSec);
   }
   return true;
@@ -283,10 +338,18 @@ int handleGetCountdownRemaining() {
   return (rem < 0) ? 0 : rem;
 }
 
-void handleSetPidState(bool enabled) {
+bool handleSetPidState(bool enabled) {
   if (enabled) {
+    if (!outputsReady || fsmState != FsmState::IDLE || armed ||
+        testUntilMs != 0 || escCalibState != EscCalibState::IDLE) {
+      return false;
+    }
     Sensors::SensorData s{};
     Sensors::snapshot(s);
+    if (!s.imuReady || !s.pressureReady || !settings.depthZeroCalibrated ||
+        s.sampleCount == 0 || millis() - s.lastUpdateMs > 500) {
+      return false;
+    }
     targetDepthCm = s.depthCm;
     rollIntegral = 0.0f;
     pitchIntegral = 0.0f;
@@ -295,10 +358,10 @@ void handleSetPidState(bool enabled) {
     pidEnabled = true;
     armed = true;
     thrustersNeutral = false;
+    return true;
   } else {
-    pidEnabled = false;
-    armed = false;
-    stopAllThrusters();
+    handleEmergencyStop();
+    return true;
   }
 }
 
@@ -310,11 +373,16 @@ uint16_t handleGetCurrentPulse(size_t index) {
 }
 
 bool handleSaveSettings() {
-  return Config::saveSettings(settings);
+  const bool saved = Config::saveSettings(settings);
+  if (saved) {
+    WirelessConfig::syncFromSettings(true);
+  }
+  return saved;
 }
 
 void handleResetDefaults() {
   Config::loadDefaults(settings);
+  WirelessConfig::syncFromSettings(false);
   stopAllThrusters();
 }
 
@@ -368,9 +436,10 @@ void updatePidStabilization(float dt) {
   Sensors::SensorData sensor{};
   Sensors::snapshot(sensor);
 
-  if (!sensor.imuReady) {
-    // If IMU is offline, fail-safe to neutral
-    stopAllThrusters();
+  if (!sensor.imuReady || !sensor.pressureReady || !settings.depthZeroCalibrated ||
+      sensor.sampleCount == 0 || millis() - sensor.lastUpdateMs > 500) {
+    CLI::logError("PID stopped: fresh IMU and calibrated depth sensor readings are required.");
+    handleEmergencyStop();
     return;
   }
 
@@ -382,15 +451,7 @@ void updatePidStabilization(float dt) {
                      settings.pidRoll.ki * rollIntegral -
                      settings.pidRoll.kd * rollRate;
 
-  // 2. Pitch PID
-  const float pitchError = 0.0f - sensor.pitch;
-  pitchIntegral = constrain(pitchIntegral + pitchError * dt, -30.0f, 30.0f);
-  const float pitchRate = sensor.gyroDps[1];
-  float pitchOutput = settings.pidPitch.kp * pitchError +
-                      settings.pidPitch.ki * pitchIntegral -
-                      settings.pidPitch.kd * pitchRate;
-
-  // 3. Depth PID
+  // 2. Depth PID
   float depthOutput = 0.0f;
   if ((sensor.pressureReady && settings.depthZeroCalibrated) || Sensors::isInjectionActive()) {
     const float depthError = targetDepthCm - sensor.depthCm;
@@ -402,13 +463,13 @@ void updatePidStabilization(float dt) {
                   settings.pidDepth.kd * depthRate;
   }
 
-  // Mixer allocation: [Surge=0, Sway=0, Heave=depthOutput, Yaw=0, Pitch=pitchOutput, Roll=rollOutput]
+  // Mixer allocation: pitch control remains disabled until actuator geometry is verified.
   const float commandedAxes[Config::AXIS_COUNT] = {
       0.0f,         // Surge
       0.0f,         // Sway
       depthOutput,  // Heave
       0.0f,         // Yaw
-      pitchOutput,  // Pitch
+      0.0f,         // Pitch is unsupported by the verified thruster geometry
       rollOutput    // Roll
   };
 
@@ -425,6 +486,16 @@ void handleOnInjected() {
 }
 
 void updateMissionStepExecution(float dt, uint32_t now) {
+  Sensors::SensorData sensor{};
+  Sensors::snapshot(sensor);
+  if (!outputsReady || !sensor.imuReady || !sensor.pressureReady ||
+      !settings.depthZeroCalibrated || sensor.sampleCount == 0 ||
+      now - sensor.lastUpdateMs > 500) {
+    CLI::logError("Mission aborted: fresh sensors, calibrated depth, and thruster outputs are required.");
+    handleEmergencyStop();
+    return;
+  }
+
   if (currentStepIndex >= Mission::getStepCount()) {
     fsmState = FsmState::MISSION_DONE;
     stopAllThrusters();
@@ -494,12 +565,8 @@ void updateMissionStepExecution(float dt, uint32_t now) {
     activeLockedDepthCm = step->targetCm;
   }
 
-  Sensors::SensorData sensor{};
-  Sensors::snapshot(sensor);
-
-  // 1. Roll & Pitch Leveling PID
+  // 1. Roll leveling PID; pitch has no verified actuator authority.
   float rollOutput = 0.0f;
-  float pitchOutput = 0.0f;
   if (sensor.imuReady) {
     const float rollError = 0.0f - sensor.roll;
     rollIntegral = constrain(rollIntegral + rollError * dt, -30.0f, 30.0f);
@@ -507,11 +574,6 @@ void updateMissionStepExecution(float dt, uint32_t now) {
                  settings.pidRoll.ki * rollIntegral -
                  settings.pidRoll.kd * sensor.gyroDps[0];
 
-    const float pitchError = 0.0f - sensor.pitch;
-    pitchIntegral = constrain(pitchIntegral + pitchError * dt, -30.0f, 30.0f);
-    pitchOutput = settings.pidPitch.kp * pitchError +
-                  settings.pidPitch.ki * pitchIntegral -
-                  settings.pidPitch.kd * sensor.gyroDps[1];
   }
 
   // 2. Translational & Yaw axes from step definition
@@ -619,7 +681,7 @@ void updateMissionStepExecution(float dt, uint32_t now) {
 
   // 3. Mix commanded axes
   const float commandedAxes[Config::AXIS_COUNT] = {
-      surge, sway, heave, yaw, pitchOutput, rollOutput
+      surge, sway, heave, yaw, 0.0f, rollOutput
   };
 
   updateThrusters(commandedAxes);
@@ -640,10 +702,15 @@ uint8_t handleGetFsmState() {
   return static_cast<uint8_t>(fsmState);
 }
 
-void handleStartEscCalib() {
+bool handleStartEscCalib() {
   if (!outputsReady) {
     CLI::logError("ESC Calibration: Outputs not ready!");
-    return;
+    return false;
+  }
+  if (fsmState != FsmState::IDLE || armed || pidEnabled || testUntilMs != 0 ||
+      escCalibState != EscCalibState::IDLE) {
+    CLI::logError("ESC Calibration requires an idle, disarmed system.");
+    return false;
   }
   escCalibState = EscCalibState::MAX_THROTTLE;
   escCalibPhaseStartMs = millis();
@@ -656,16 +723,73 @@ void handleStartEscCalib() {
   Serial.println();
   Serial.println(F("[ESC CALIB] Phase 1/3: Outputting MAX throttle (2000us) to all 6 ESCs."));
   Serial.println(F("[ESC CALIB] Waiting 3.0s for high-throttle confirmation beeps..."));
+  return true;
 }
 
-void handleSetRawPulseAll(uint16_t pulseUs) {
-  if (!outputsReady) return;
+bool handleSetRawPulseAll(uint16_t pulseUs) {
+  if (!outputsReady || (pulseUs != 1000 && pulseUs != 1500 && pulseUs != 2000)) {
+    return false;
+  }
+  if (pulseUs != 1500 &&
+      (fsmState != FsmState::IDLE || armed || pidEnabled || testUntilMs != 0 ||
+       escCalibState != EscCalibState::IDLE)) {
+    return false;
+  }
+  if (pulseUs == 1500) {
+    handleEmergencyStop();
+    return true;
+  }
   armed = (pulseUs != 1500);
-  thrustersNeutral = (pulseUs == 1500);
+  thrustersNeutral = false;
   for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
     thrusters[i].writeMicroseconds(pulseUs);
     currentPulse[i] = pulseUs;
   }
+  return true;
+}
+
+bool handleSetHilMode(bool enabled) {
+  if (!enabled) {
+    if (hilModeActive) handleEmergencyStop();
+    return true;
+  }
+  if (!outputsReady || fsmState != FsmState::IDLE || armed || pidEnabled ||
+      testUntilMs != 0 || escCalibState != EscCalibState::IDLE ||
+      settings.autoRunEnabled || Sensors::isInjectionActive()) {
+    return false;
+  }
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    if (settings.thrusters[i].pulseNeutral != 1500) return false;
+  }
+
+  hilModeActive = true;
+  hilLastCommandMs = millis();
+  armed = true;
+  thrustersNeutral = true;
+  stopAllThrusters();
+  return true;
+}
+
+bool handleSetHilPulses(const uint16_t* pulses) {
+  if (!pulses || !outputsReady || !hilModeActive || !armed ||
+      fsmState != FsmState::IDLE || pidEnabled || testUntilMs != 0 ||
+      escCalibState != EscCalibState::IDLE) {
+    return false;
+  }
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    if (pulses[i] < 1500 - HIL_MAX_DELTA_US ||
+        pulses[i] > 1500 + HIL_MAX_DELTA_US) {
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < Config::THRUSTER_COUNT; ++i) {
+    thrusters[i].writeMicroseconds(pulses[i]);
+    currentPulse[i] = pulses[i];
+  }
+  thrustersNeutral = false;
+  hilLastCommandMs = millis();
+  return true;
 }
 
 void updateEscCalib(uint32_t now) {
@@ -718,22 +842,24 @@ void updateAutoRunCountdown(uint32_t now) {
     // Surface Tare Calibration (MS5803 zero pressure) at configured autoRunTareSec
     if (remSec <= settings.autoRunTareSec && !countdownTareDone) {
       countdownTareDone = true;
-      if (Sensors::calibrateDepthZero(settings)) {
+      countdownTareSucceeded = Sensors::calibrateDepthZero(settings);
+      if (countdownTareSucceeded) {
         Serial.printf("[AUTORUN] Surface tare complete: MS5803 zero reference at %.1f mbar.\r\n",
                       settings.depthZeroPressureMbar);
       } else {
-        Serial.println(F("[AUTORUN] Surface tare: MS5803 offline, using stored reference."));
+        Serial.println(F("[AUTORUN] Surface tare failed; mission launch will be aborted."));
       }
     }
 
     // IMU Leveling Calibration (MPU-6050 level pitch/roll offsets) at configured autoRunLevelSec
     if (remSec <= settings.autoRunLevelSec && !countdownImuDone) {
       countdownImuDone = true;
-      if (Sensors::calibrateImuLevel(settings)) {
+      countdownImuSucceeded = Sensors::calibrateImuLevel(settings);
+      if (countdownImuSucceeded) {
         Serial.printf("[AUTORUN] IMU leveling complete: Pitch offset=%.1f°, Roll offset=%.1f°.\r\n",
                       settings.pitchOffset, settings.rollOffset);
       } else {
-        Serial.println(F("[AUTORUN] IMU leveling: MPU-6050 offline, using stored offsets."));
+        Serial.println(F("[AUTORUN] IMU leveling failed; mission launch will be aborted."));
       }
     }
 
@@ -745,11 +871,14 @@ void updateAutoRunCountdown(uint32_t now) {
 
   // T-0s: Transition to MISSION_RUNNING
   if (elapsedMs >= static_cast<uint32_t>(countdownDurationSec) * 1000) {
-    if (Mission::getStepCount() == 0) {
-      Serial.println(F("[AUTORUN] ERROR: No mission steps found in /jalur.json! Aborting launch."));
-      fsmState = FsmState::IDLE;
-      armed = false;
-      stopAllThrusters();
+    Sensors::SensorData sensor{};
+    Sensors::snapshot(sensor);
+    if (Mission::getStepCount() == 0 || !outputsReady || !sensor.imuReady ||
+        !sensor.pressureReady || !countdownTareSucceeded ||
+        !countdownImuSucceeded || !settings.depthZeroCalibrated ||
+        sensor.sampleCount == 0 || now - sensor.lastUpdateMs > 500) {
+      Serial.println(F("[AUTORUN] ERROR: Mission preflight failed (route, outputs, fresh sensors, or calibration). Aborting launch."));
+      handleEmergencyStop();
       CLI::printPrompt();
     } else {
       Serial.println();
@@ -784,6 +913,147 @@ void updateAutoRunCountdown(uint32_t now) {
   }
 }
 
+void startAutoRunCountdown(uint32_t now) {
+  fsmState = FsmState::COUNTDOWN;
+  countdownStartMs = now;
+  countdownDurationSec = settings.autoRunDelaySec;
+  countdownLastSecLogged = -1;
+  countdownTareDone = false;
+  countdownImuDone = false;
+  countdownTareSucceeded = false;
+  countdownImuSucceeded = false;
+  Serial.println();
+  Serial.println(F("\033[1;36m[AUTORUN] Auto-Run on Boot is ENABLED!\033[0m"));
+  Serial.printf("[AUTORUN] Launch countdown: %u seconds to launch. Send 'stop' to abort.\r\n",
+                countdownDurationSec);
+}
+
+bool stableBootCalibrationSample(
+    const Sensors::SensorData& sample,
+    bool tareDepth,
+    bool levelImu) {
+  const float accelerationMagnitude = sqrtf(
+      sample.accelG[0] * sample.accelG[0] +
+      sample.accelG[1] * sample.accelG[1] +
+      sample.accelG[2] * sample.accelG[2]);
+  const bool pressureReady = !tareDepth ||
+      (sample.pressureReady && isfinite(sample.pressureMbar) &&
+       sample.pressureMbar >= 500.0f && sample.pressureMbar <= 2000.0f);
+  const bool levelOrientation = !levelImu ||
+      (fabsf(sample.rawPitch) <= 10.0f && fabsf(sample.rawRoll) <= 10.0f);
+  return sample.imuReady && sample.sampleCount > 0 &&
+      millis() - sample.lastUpdateMs <= 500 && pressureReady &&
+      isfinite(sample.rawPitch) && isfinite(sample.rawRoll) && levelOrientation &&
+      isfinite(accelerationMagnitude) && accelerationMagnitude >= 0.8f &&
+      accelerationMagnitude <= 1.2f &&
+      isfinite(sample.gyroDps[0]) && fabsf(sample.gyroDps[0]) <= 2.0f &&
+      isfinite(sample.gyroDps[1]) && fabsf(sample.gyroDps[1]) <= 2.0f &&
+      isfinite(sample.gyroDps[2]) && fabsf(sample.gyroDps[2]) <= 2.0f;
+}
+
+bool bootCalibrationSampleContinuous(
+    const Sensors::SensorData& previous,
+    const Sensors::SensorData& current,
+    bool tareDepth) {
+  return fabsf(current.rawPitch - previous.rawPitch) <= 0.6f &&
+      fabsf(current.rawRoll - previous.rawRoll) <= 0.6f &&
+      (!tareDepth || fabsf(current.pressureMbar - previous.pressureMbar) <= 2.0f);
+}
+
+void finishBootCalibration(bool succeeded, uint32_t now) {
+  bootCalibrationPending = false;
+  if (settings.autoRunEnabled) {
+    if (succeeded) {
+      startAutoRunCountdown(now);
+    } else {
+      fsmState = FsmState::ABORTED;
+      Serial.println(F("[BOOT CALIB] Auto-Run cancelled because startup calibration failed."));
+      CLI::printPrompt();
+    }
+  } else {
+    fsmState = FsmState::IDLE;
+  }
+}
+
+void updateBootCalibration(uint32_t now) {
+  if (!bootCalibrationPending) return;
+  const bool tareDepth = settings.autoDepthTareOnBoot != 0;
+  const bool levelImu = settings.autoImuLevelOnBoot != 0;
+  if (now - bootCalibrationStartedAtMs >= BOOT_CALIBRATION_TIMEOUT_MS) {
+    Serial.println(F("[BOOT CALIB] Timed out; previous sensor calibration was kept."));
+    finishBootCalibration(false, now);
+    return;
+  }
+  if (now - bootCalibrationLastSampleAtMs < BOOT_CALIBRATION_SAMPLE_INTERVAL_MS) return;
+  bootCalibrationLastSampleAtMs = now;
+
+  Sensors::SensorData sample{};
+  Sensors::snapshot(sample);
+  if (Sensors::isInjectionActive() ||
+      !stableBootCalibrationSample(sample, tareDepth, levelImu)) {
+    bootCalibrationStableSamples = 0;
+    bootCalibrationHasPreviousSample = false;
+    return;
+  }
+  if (bootCalibrationHasPreviousSample &&
+      (!bootCalibrationSampleContinuous(bootCalibrationPreviousSample, sample, tareDepth) ||
+       fabsf(sample.rawPitch - bootCalibrationInitialSample.rawPitch) > 1.0f ||
+       fabsf(sample.rawRoll - bootCalibrationInitialSample.rawRoll) > 1.0f ||
+       (tareDepth &&
+        fabsf(sample.pressureMbar - bootCalibrationInitialSample.pressureMbar) > 3.0f))) {
+    bootCalibrationStableSamples = 0;
+    bootCalibrationHasPreviousSample = false;
+  }
+  if (bootCalibrationStableSamples == 0) {
+    bootCalibrationStableSinceMs = now;
+    bootCalibrationInitialSample = sample;
+  }
+  bootCalibrationStableSamples++;
+  bootCalibrationPreviousSample = sample;
+  bootCalibrationHasPreviousSample = true;
+
+  if (bootCalibrationStableSamples < BOOT_CALIBRATION_REQUIRED_SAMPLES ||
+      now - bootCalibrationStableSinceMs < BOOT_CALIBRATION_STABLE_MS) {
+    return;
+  }
+
+  Config::Settings calibrated = settings;
+  const bool depthCalibrated =
+      !tareDepth || (Sensors::calibrateDepthZero(calibrated) && calibrated.depthZeroCalibrated);
+  const bool imuLeveled = !levelImu || Sensors::calibrateImuLevel(calibrated);
+  if (!depthCalibrated || !imuLeveled) {
+    Serial.println(F("[BOOT CALIB] Calibration failed; previous sensor calibration was kept."));
+    finishBootCalibration(false, now);
+    return;
+  }
+
+  const bool changed =
+      (tareDepth &&
+       (!settings.depthZeroCalibrated ||
+        fabsf(calibrated.depthZeroPressureMbar - settings.depthZeroPressureMbar) >= 0.2f)) ||
+      (levelImu &&
+       (fabsf(calibrated.pitchOffset - settings.pitchOffset) >= 0.1f ||
+        fabsf(calibrated.rollOffset - settings.rollOffset) >= 0.1f));
+  if (changed) {
+    if (!Config::saveSettings(calibrated)) {
+      Serial.println(F("[BOOT CALIB] EEPROM save failed; previous sensor calibration was kept."));
+      finishBootCalibration(false, now);
+      return;
+    }
+    settings = calibrated;
+    WirelessConfig::syncFromSettings(true);
+  }
+
+  Serial.printf("[BOOT CALIB] Startup calibration complete%s:",
+                changed ? " and saved" : " (no EEPROM change)");
+  if (tareDepth) Serial.printf(" depth zero %.1f mbar;", calibrated.depthZeroPressureMbar);
+  if (levelImu) {
+    Serial.printf(" pitch %.1f deg, roll %.1f deg;", calibrated.pitchOffset, calibrated.rollOffset);
+  }
+  Serial.println();
+  finishBootCalibration(true, now);
+}
+
 }  // namespace
 
 void setup() {
@@ -793,7 +1063,7 @@ void setup() {
   if (!Config::loadSettings(settings)) {
     Serial.println(F("[EEPROM] Defaults loaded (fresh EEPROM or version mismatch)."));
     Config::saveSettings(settings);
-    Serial.println(F("[EEPROM] Version 6 defaults migrated & saved to EEPROM."));
+    Serial.println(F("[EEPROM] Version 8 defaults migrated & saved to EEPROM."));
   } else {
     Serial.printf("[EEPROM] Configuration loaded successfully (Checksum: 0x%08lX).\r\n", settings.checksum);
   }
@@ -803,9 +1073,19 @@ void setup() {
 
   // Initialize sensors (Wire1 on GP26/GP27)
   Sensors::begin();
+  bootCalibrationPending =
+      settings.autoDepthTareOnBoot != 0 || settings.autoImuLevelOnBoot != 0;
+  bootCalibrationStartedAtMs = millis();
+  bootCalibrationLastSampleAtMs =
+      bootCalibrationStartedAtMs - BOOT_CALIBRATION_SAMPLE_INTERVAL_MS;
+  bootCalibrationStableSamples = 0;
+  bootCalibrationHasPreviousSample = false;
+  bootCalibrationInitialSample = Sensors::SensorData{};
 
   // Initialize LittleFS & Load Mission Trajectory
-  Mission::begin();
+  if (!Mission::begin()) {
+    CLI::logError("Mission storage or route unavailable; mission launch remains disabled until repaired.");
+  }
 
   // Initialize interactive Serial CLI
   CLI::MotorControlInterface iface{
@@ -830,21 +1110,34 @@ void setup() {
       handleGetTargetDepth,
       handleGetFsmState,
       handleStartEscCalib,
-      handleSetRawPulseAll
+      handleSetRawPulseAll,
+      handleSetHilMode,
+      handleSetHilPulses,
+      []() -> bool { return hilModeActive; }
   };
   CLI::begin(iface);
+  WirelessConfig::begin(
+      settings, armed, handleGetFsmState, stopAllThrusters, handleGetCurrentPulse,
+      []() -> bool {
+        return fsmState == FsmState::IDLE && !armed && !pidEnabled &&
+               thrustersNeutral && testUntilMs == 0 &&
+               escCalibState == EscCalibState::IDLE && !hilModeActive &&
+               !settings.autoRunEnabled && !bootCalibrationPending &&
+               !Sensors::isInjectionActive();
+      },
+      []() { handleEmergencyStop(); });
 
-  // Auto-run on boot check:
-  if (settings.autoRunEnabled) {
-    fsmState = FsmState::COUNTDOWN;
-    countdownStartMs = millis();
-    countdownDurationSec = settings.autoRunDelaySec;
-    countdownLastSecLogged = -1;
-    countdownTareDone = false;
-    countdownImuDone = false;
-    Serial.println();
-    Serial.println(F("\033[1;36m[AUTORUN] Auto-Run on Boot is ENABLED!\033[0m"));
-    Serial.printf("[AUTORUN] Launch countdown: %u seconds to launch. Send 'stop' to abort.\r\n", countdownDurationSec);
+  if (bootCalibrationPending) {
+    fsmState = FsmState::BOOT_CALIBRATING;
+    if (settings.autoDepthTareOnBoot) {
+      Serial.println(F("[BOOT CALIB] Automatic depth zero enabled; vehicle must be at the water surface."));
+    }
+    if (settings.autoImuLevelOnBoot) {
+      Serial.println(F("[BOOT CALIB] Automatic IMU level enabled; vehicle must be stationary and level."));
+    }
+    Serial.println(F("[BOOT CALIB] Waiting for stable readings; no thrusters will be activated."));
+  } else if (settings.autoRunEnabled) {
+    startAutoRunCountdown(millis());
   } else {
     fsmState = FsmState::IDLE;
   }
@@ -853,24 +1146,36 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  // Watchdog for simulation sensor injection:
-  // If $INJ stops for > 500ms, automatically clamp thrusters to neutral (1500us) and revert to physical sensors.
+  if (WirelessConfig::firmwareUpdateInProgress()) {
+    while (Serial.available() > 0) Serial.read();
+    WirelessConfig::update();
+    while (Serial.available() > 0) Serial.read();
+    return;
+  }
+
+  // Injection loss aborts every active mode so mission output cannot resume afterward.
   static bool injectionWasActive = false;
   bool injectionIsActive = Sensors::isInjectionActive();
   if (injectionWasActive && !injectionIsActive) {
     injectionWasActive = false;
-    stopAllThrusters();
-    if (pidEnabled) {
-      pidEnabled = false;
-      armed = false;
-    }
-    CLI::logWarn("Simulation injection watchdog timeout (>500ms) - Thrusters clamped to neutral");
+    handleEmergencyStop();
+    CLI::logWarn("Simulation injection watchdog timeout (>500ms) - mission aborted and thrusters neutralized");
   } else if (injectionIsActive) {
     injectionWasActive = true;
   }
 
   // 1. Process CLI input (machine packets & human commands)
   CLI::update();
+  const uint32_t hilCheckMs = millis();
+  if (hilModeActive && hilCheckMs - hilLastCommandMs > HIL_WATCHDOG_MS) {
+    handleEmergencyStop();
+    CLI::logWarn("HIL heartbeat timeout (>350ms); thrusters neutralized and disarmed.");
+  }
+  WirelessConfig::update();
+  if (WirelessConfig::firmwareUpdateInProgress()) {
+    while (Serial.available() > 0) Serial.read();
+    return;
+  }
 
   // Telemetry Stream Emission (e.g. 10 Hz non-blocking)
   if (CLI::isTelemActive()) {
@@ -884,6 +1189,7 @@ void loop() {
 
   // 2. Update sensor sampling & complementary filters (50 Hz)
   Sensors::update(settings);
+  updateBootCalibration(millis());
 
   // 3. Periodic motor output loop (50 Hz / 20 ms)
   if (now - lastOutputAtMs >= OUTPUT_INTERVAL_MS) {

@@ -54,3 +54,12 @@ Thumbs.db
 *.bak
 *.tmp
 *.log
+.pytest_cache/
+simulasi_auv/backups/
+simulasi_auv/_inline_*.js
+src/wireless_secrets.h
+
+# Android configuration client
+android-config/.gradle/
+android-config/local.properties
+android-config/app/build/

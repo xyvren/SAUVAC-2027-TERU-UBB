@@ -1,6 +1,7 @@
 #include "mission.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <math.h>
 
 namespace Mission {
 
@@ -56,7 +57,17 @@ constexpr const char* DEFAULT_JALUR_JSON = R"([
   }
 ])";
 
-bool parseJsonDoc(const JsonDocument& doc, String& errMessage) {
+bool readNumber(JsonVariantConst value, float& result) {
+  if (value.isNull() || value.is<const char*>() || value.is<bool>() ||
+      value.is<JsonArrayConst>() || value.is<JsonObjectConst>()) {
+    return false;
+  }
+  result = value.as<float>();
+  return isfinite(result);
+}
+
+bool parseJsonDoc(const JsonDocument& doc, Step* parsedSteps, size_t& parsedCount,
+                  String& errMessage) {
   JsonArrayConst arr = doc.as<JsonArrayConst>();
   if (arr.isNull()) {
     errMessage = "JSON root must be an array of step objects.";
@@ -66,65 +77,235 @@ bool parseJsonDoc(const JsonDocument& doc, String& errMessage) {
     errMessage = "JSON array is empty.";
     return false;
   }
+  if (arr.size() > MAX_STEPS) {
+    errMessage = "Mission exceeds MAX_STEPS (32); no steps were loaded.";
+    return false;
+  }
 
   size_t count = 0;
   Step tempSteps[MAX_STEPS];
 
   for (JsonObjectConst item : arr) {
-    if (count >= MAX_STEPS) {
-      Serial.printf("[WARN] Trajectory exceeds MAX_STEPS (%u). Truncating.\r\n", static_cast<unsigned>(MAX_STEPS));
-      break;
+    if (item.isNull()) {
+      errMessage = "Each mission step must be a JSON object.";
+      return false;
     }
 
     Step& step = tempSteps[count];
-    step.stepNum = item["langkah"] | item["step"] | static_cast<uint16_t>(count + 1);
+    JsonVariantConst stepNumValue = item["langkah"];
+    if (stepNumValue.isNull()) stepNumValue = item["step"];
+    if (stepNumValue.isNull()) {
+      step.stepNum = static_cast<uint16_t>(count + 1);
+    } else {
+      float stepNum = 0.0f;
+      if (!readNumber(stepNumValue, stepNum) || stepNum < 1.0f ||
+          stepNum > 65535.0f || floorf(stepNum) != stepNum) {
+        errMessage = "Step number must be an integer between 1 and 65535.";
+        return false;
+      }
+      step.stepNum = static_cast<uint16_t>(stepNum);
+    }
 
     const char* rawName = item["nama"] | item["name"] | "";
-    if (rawName && strlen(rawName) > 0) {
-      strncpy(step.name, rawName, sizeof(step.name) - 1);
-      step.name[sizeof(step.name) - 1] = '\0';
-    } else {
-      snprintf(step.name, sizeof(step.name), "Langkah %u", step.stepNum);
+    if (!rawName || strlen(rawName) == 0 || strlen(rawName) >= sizeof(step.name)) {
+      errMessage = "Step name must contain 1-35 characters.";
+      return false;
     }
+    strncpy(step.name, rawName, sizeof(step.name) - 1);
+    step.name[sizeof(step.name) - 1] = '\0';
 
     const char* rawAct = item["aksi"] | item["action"] | "";
     step.action = stringToAction(rawAct ? rawAct : "");
+    if (step.action == Action::UNKNOWN) {
+      errMessage = "Step action is missing or unsupported.";
+      return false;
+    }
 
-    step.power = item["daya"] | item["power"] | 0.0f;
-    step.durationSec = item["durasi_detik"] | item["durasi"] | item["duration"] | item["duration_sec"] | 0.0f;
-    step.targetCm = item["target_cm"] | item["target"] | item["depth_cm"] | 0.0f;
+    JsonVariantConst powerValue = item["daya"];
+    if (powerValue.isNull()) powerValue = item["power"];
+    JsonVariantConst durationValue = item["durasi_detik"];
+    if (durationValue.isNull()) durationValue = item["durasi"];
+    if (durationValue.isNull()) durationValue = item["duration"];
+    if (durationValue.isNull()) durationValue = item["duration_sec"];
+    JsonVariantConst targetValue = item["target_cm"];
+    if (targetValue.isNull()) targetValue = item["target"];
+    if (targetValue.isNull()) targetValue = item["depth_cm"];
+    step.targetCm = 0.0f;
+    if (!readNumber(powerValue, step.power) ||
+        !readNumber(durationValue, step.durationSec) ||
+        (!targetValue.isNull() && !readNumber(targetValue, step.targetCm))) {
+      errMessage = "Power, duration, and target must be finite JSON numbers.";
+      return false;
+    }
+    if (step.power < 0.0f || step.power > 100.0f ||
+        step.durationSec < 0.1f || step.durationSec > 600.0f ||
+        step.targetCm < 0.0f || step.targetCm > 140.0f) {
+      errMessage = "Power must be 0-100%, duration 0.1-600s, and target 0-140cm.";
+      return false;
+    }
 
-    // Parse active thrusters mask or array
     uint8_t mask = 0;
+    if (item.containsKey("motors") && item.containsKey("motor_mask")) {
+      errMessage = "Specify either motors or motor_mask, not both.";
+      return false;
+    }
     if (item.containsKey("motors")) {
       JsonVariantConst mVar = item["motors"];
       if (mVar.is<JsonArrayConst>()) {
-        for (JsonVariantConst v : mVar.as<JsonArrayConst>()) {
-          int mId = v.as<int>();
-          if (mId >= 1 && mId <= 6) {
-            mask |= (1 << (mId - 1));
-          }
+        JsonArrayConst motors = mVar.as<JsonArrayConst>();
+        if (motors.size() == 0) {
+          errMessage = "Motors array must not be empty.";
+          return false;
         }
-      } else if (mVar.is<int>()) {
-        mask = static_cast<uint8_t>(mVar.as<int>());
+        for (JsonVariantConst v : motors) {
+          float motorId = 0.0f;
+          if (!readNumber(v, motorId) || motorId < 1.0f || motorId > 6.0f ||
+              floorf(motorId) != motorId) {
+            errMessage = "Motor IDs must be integers between 1 and 6.";
+            return false;
+          }
+          mask |= static_cast<uint8_t>(1U << (static_cast<uint8_t>(motorId) - 1));
+        }
+      } else {
+        float parsedMask = 0.0f;
+        if (!readNumber(mVar, parsedMask) || parsedMask < 1.0f ||
+            parsedMask > 63.0f || floorf(parsedMask) != parsedMask) {
+          errMessage = "Motor mask must be between 1 and 63.";
+          return false;
+        }
+        mask = static_cast<uint8_t>(parsedMask);
       }
     } else if (item.containsKey("motor_mask")) {
-      mask = static_cast<uint8_t>(item["motor_mask"].as<int>());
+      float parsedMask = 0.0f;
+      if (!readNumber(item["motor_mask"], parsedMask) ||
+          parsedMask < 1.0f || parsedMask > 63.0f || floorf(parsedMask) != parsedMask) {
+        errMessage = "Motor mask must be an integer between 1 and 63.";
+        return false;
+      }
+      mask = static_cast<uint8_t>(parsedMask);
     }
 
     if (mask == 0) {
       mask = getDefaultMotorMask(step.action, step.targetCm);
+    }
+    if (mask == 0 || (mask & 0xC0) != 0) {
+      errMessage = "Mission step must select at least one valid thruster.";
+      return false;
     }
     step.motorMask = mask;
 
     count++;
   }
 
-  stepCount = count;
+  parsedCount = count;
   for (size_t i = 0; i < count; ++i) {
-    loadedSteps[i] = tempSteps[i];
+    parsedSteps[i] = tempSteps[i];
   }
 
+  return true;
+}
+
+bool parseMissionFile(const char* path, Step* parsedSteps, size_t& parsedCount,
+                      String& errMessage) {
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    errMessage = String("Failed to open '") + path + "' for reading.";
+    return false;
+  }
+  if (f.size() == 0 || f.size() > 3500) {
+    f.close();
+    errMessage = "Mission file must be between 1 and 3500 bytes.";
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    errMessage = String("JSON deserialization error: ") + err.c_str();
+    return false;
+  }
+  if (doc.overflowed()) {
+    errMessage = "Mission JSON exceeds available parser capacity.";
+    return false;
+  }
+  return parseJsonDoc(doc, parsedSteps, parsedCount, errMessage);
+}
+
+bool saveJsonStringToPath(const String& jsonStr, const char* path, String& errMessage) {
+  if (jsonStr.length() == 0 || jsonStr.length() > 3500) {
+    errMessage = "Mission JSON must be between 1 and 3500 bytes.";
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, jsonStr);
+  if (err) {
+    errMessage = String("JSON parse error: ") + err.c_str();
+    return false;
+  }
+  if (doc.overflowed()) {
+    errMessage = "Mission JSON exceeds available parser capacity.";
+    return false;
+  }
+
+  Step parsedSteps[MAX_STEPS];
+  size_t parsedCount = 0;
+  if (!parseJsonDoc(doc, parsedSteps, parsedCount, errMessage)) {
+    return false;
+  }
+
+  char tempPath[64];
+  char backupPath[64];
+  if (snprintf(tempPath, sizeof(tempPath), "%s.tmp", path) >= static_cast<int>(sizeof(tempPath)) ||
+      snprintf(backupPath, sizeof(backupPath), "%s.bak", path) >= static_cast<int>(sizeof(backupPath))) {
+    errMessage = "Mission file path is too long.";
+    return false;
+  }
+
+  const size_t expectedBytes = measureJsonPretty(doc);
+  File temp = LittleFS.open(tempPath, "w");
+  if (!temp) {
+    errMessage = "Failed to open temporary mission file for writing.";
+    return false;
+  }
+  const size_t written = serializeJsonPretty(doc, temp);
+  temp.flush();
+  temp.close();
+  if (written != expectedBytes) {
+    LittleFS.remove(tempPath);
+    errMessage = "Incomplete write while saving mission file.";
+    return false;
+  }
+
+  Step verifiedSteps[MAX_STEPS];
+  size_t verifiedCount = 0;
+  String verifyError;
+  if (!parseMissionFile(tempPath, verifiedSteps, verifiedCount, verifyError)) {
+    LittleFS.remove(tempPath);
+    errMessage = String("Temporary mission verification failed: ") + verifyError;
+    return false;
+  }
+
+  const bool hadOriginal = LittleFS.exists(path);
+  LittleFS.remove(backupPath);
+  if (hadOriginal && !LittleFS.rename(path, backupPath)) {
+    LittleFS.remove(tempPath);
+    errMessage = "Failed to preserve the existing mission file.";
+    return false;
+  }
+  if (!LittleFS.rename(tempPath, path)) {
+    if (hadOriginal) LittleFS.rename(backupPath, path);
+    LittleFS.remove(tempPath);
+    errMessage = "Failed to commit the new mission file.";
+    return false;
+  }
+  if (hadOriginal) LittleFS.remove(backupPath);
+
+  stepCount = parsedCount;
+  for (size_t i = 0; i < parsedCount; ++i) {
+    loadedSteps[i] = parsedSteps[i];
+  }
   return true;
 }
 
@@ -238,34 +419,25 @@ void maskToString(uint8_t mask, char* out, size_t outSize) {
 
 bool begin() {
   if (!LittleFS.begin()) {
-    Serial.println(F("[LittleFS] Warning: LittleFS mount failed, formatting..."));
-    if (LittleFS.format() && LittleFS.begin()) {
-      Serial.println(F("[LittleFS] Formatted and mounted successfully."));
-    } else {
-      Serial.println(F("[LittleFS] ERROR: LittleFS mount failed!"));
-      return false;
-    }
+    Serial.println(F("[LittleFS] ERROR: Mount failed; filesystem was not formatted to protect stored missions."));
+    return false;
   }
 
   if (!LittleFS.exists(JALUR_FILE)) {
     Serial.println(F("[LittleFS] /jalur.json not found. Creating default trajectory..."));
-    saveDefaultFile();
+    return saveDefaultFile();
   } else {
-    loadFromFile();
+    return loadFromFile();
   }
-  return true;
 }
 
 bool saveDefaultFile(const char* path) {
-  File f = LittleFS.open(path, "w");
-  if (!f) {
-    Serial.printf("[LittleFS] Failed to open '%s' for writing default.\r\n", path);
-    return false;
+  String errMessage;
+  const bool saved = saveJsonStringToPath(String(DEFAULT_JALUR_JSON), path, errMessage);
+  if (!saved) {
+    Serial.printf("[LittleFS] Failed to save default mission: %s\r\n", errMessage.c_str());
   }
-  f.print(DEFAULT_JALUR_JSON);
-  f.close();
-
-  return loadFromFile(path);
+  return saved;
 }
 
 bool loadFromFile(const char* path) {
@@ -274,53 +446,25 @@ bool loadFromFile(const char* path) {
     return false;
   }
 
-  File f = LittleFS.open(path, "r");
-  if (!f) {
-    Serial.printf("[JALUR] Failed to open '%s' for reading.\r\n", path);
-    return false;
-  }
-
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-
-  if (err) {
-    Serial.printf("[JALUR] JSON deserialization error from '%s': %s\r\n", path, err.c_str());
-    return false;
-  }
-
+  Step parsedSteps[MAX_STEPS];
+  size_t parsedCount = 0;
   String errMessage;
-  if (!parseJsonDoc(doc, errMessage)) {
+  if (!parseMissionFile(path, parsedSteps, parsedCount, errMessage)) {
     Serial.printf("[JALUR] Error parsing '%s': %s\r\n", path, errMessage.c_str());
     return false;
   }
 
+  stepCount = parsedCount;
+  for (size_t i = 0; i < parsedCount; ++i) {
+    loadedSteps[i] = parsedSteps[i];
+  }
   Serial.printf("[JALUR] Loaded %u steps from '%s'.\r\n",
                 static_cast<unsigned>(stepCount), path);
   return true;
 }
 
 bool saveJsonString(const String& jsonStr, String& errMessage) {
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(doc, jsonStr);
-  if (err) {
-    errMessage = String("JSON parse error: ") + err.c_str();
-    return false;
-  }
-
-  if (!parseJsonDoc(doc, errMessage)) {
-    return false;
-  }
-
-  File f = LittleFS.open(JALUR_FILE, "w");
-  if (!f) {
-    errMessage = "Failed to open /jalur.json on LittleFS for writing.";
-    return false;
-  }
-
-  serializeJsonPretty(doc, f);
-  f.close();
-  return true;
+  return saveJsonStringToPath(jsonStr, JALUR_FILE, errMessage);
 }
 
 size_t getStepCount() {

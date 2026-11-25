@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-AUV SAUVAC - Reinforcement Learning Adaptive PID & Hydrodynamic Physics Engine
+AUV SAUVAC - Heuristic PID Gain Search & Reduced Hydrodynamic Simulation
 Universitas Bangka Belitung - SAUVC 2027
 
-Runs on laptop CPU to optimize and monitor closed-loop PID control:
-- 6-DOF Hydrodynamic simulation (mass, added mass, net positive buoyancy, quadratic drag)
+Runs on laptop CPU as an experimental simulator:
+- Reduced 1D depth-response model (mass, added mass, buoyancy, quadratic drag)
 - Wave/current stochastic disturbances
-- Actor-Critic / Q-Policy adaptation minimizing ITAE (Integral Time Absolute Error)
+- Bounded stochastic gain search minimizing ITAE (not reinforcement learning)
 - Safe gain ceilings and real-time step response telemetry
+
+The model is not validated for hardware deployment.
 """
 
 import copy
@@ -17,15 +19,15 @@ import threading
 import time
 
 class AUVHydrodynamicsSim:
-    """Non-linear 1D/3D hydrodynamic physics simulation for AUV depth & surge."""
+    """Reduced one-dimensional nonlinear depth-response simulation."""
 
     def __init__(self, mass: float = 14.5, net_buoyancy_g: float = 150.0, drag_scale: float = 1.0):
         # Physical parameters of SAUVAC AUV
-        self.mass = float(mass)        # kg (dry mass, configurable 8.0 to 25.0 kg)
+        self.mass = float(mass)        # kg (dry mass, configurable 5.0 to 50.0 kg)
         self.added_mass_z = 8.2        # kg (hydrodynamic added mass in heave)
         self.total_mass_z = self.mass + self.added_mass_z
         self.net_buoyancy_g = float(net_buoyancy_g)
-        self.net_buoyancy = (self.net_buoyancy_g / 1000.0) * 9.80665  # N (positive net buoyancy)
+        self.net_buoyancy = (self.net_buoyancy_g / 1000.0) * 9.80665  # N (positive is upward)
         self.drag_scale = float(drag_scale)
         self.rho = 1000.0              # kg/m^3 (water density)
         self.cd_z = 0.85 * self.drag_scale  # Drag coefficient (heave)
@@ -51,7 +53,7 @@ class AUVHydrodynamicsSim:
             self.mass = max(5.0, min(50.0, float(mass)))
             self.total_mass_z = self.mass + self.added_mass_z
         if net_buoyancy_g is not None:
-            self.net_buoyancy_g = max(0.0, min(1000.0, float(net_buoyancy_g)))
+            self.net_buoyancy_g = max(-1000.0, min(1000.0, float(net_buoyancy_g)))
             self.net_buoyancy = (self.net_buoyancy_g / 1000.0) * 9.80665
         if drag_scale is not None:
             self.drag_scale = max(0.2, min(5.0, float(drag_scale)))
@@ -205,7 +207,7 @@ class RLPIDOptimizer:
             self.step_response = trajectory
 
     def train_simulation(self, disturbance: float = None, episodes: int = 30) -> dict:
-        """Executes RL training iterations over hydrodynamic physics environment."""
+        """Searches candidate depth PID gains against the reduced model."""
         with self.lock:
             self.status = "TRAINING"
             if disturbance is not None:
@@ -213,7 +215,7 @@ class RLPIDOptimizer:
                 
         t_start = time.time()
         
-        # Policy gradient / Q-parameter search
+        # Bounded stochastic candidate search
         best_kp = self.adaptive_gains["depth"]["kp"]
         best_ki = self.adaptive_gains["depth"]["ki"]
         best_kd = self.adaptive_gains["depth"]["kd"]
@@ -313,7 +315,7 @@ class RLPIDOptimizer:
             if mass is not None:
                 self.mass = max(5.0, min(50.0, float(mass)))
             if net_buoyancy_g is not None:
-                self.net_buoyancy_g = max(0.0, min(1000.0, float(net_buoyancy_g)))
+                self.net_buoyancy_g = max(-1000.0, min(1000.0, float(net_buoyancy_g)))
             if drag_scale is not None:
                 self.drag_scale = max(0.2, min(5.0, float(drag_scale)))
             self._simulate_step_response()

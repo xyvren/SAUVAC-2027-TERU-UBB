@@ -4,9 +4,9 @@
 
 [![Microcontroller](https://img.shields.io/badge/MCU-Raspberry%20Pi%20Pico%20W%20(RP2040)-C51A4A?style=for-the-badge&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/products/raspberry-pi-pico/)
 [![Target](https://img.shields.io/badge/Target-SAUVC%202027-0052CC?style=for-the-badge&logo=target&logoColor=white)](https://sauvc.org/)
-[![Physics](https://img.shields.io/badge/Hydrodynamics-Fossen%206--DOF%20%2F%20SNAME-00875A?style=for-the-badge)](simulasi_auv/)
+[![Physics](https://img.shields.io/badge/Physics-Experimental%20Reduced%20Model-00875A?style=for-the-badge)](simulasi_auv/)
 [![Simulation](https://img.shields.io/badge/Digital%20Twin-Three.js%203D%20%2B%20Canvas%202D-FF5630?style=for-the-badge&logo=three.js&logoColor=white)](simulasi_auv/)
-[![Build Status](https://img.shields.io/badge/Firmware-Verified%20(0%20Warnings)-success?style=for-the-badge&logo=platformio&logoColor=white)](firmware/)
+[![Build Status](https://img.shields.io/badge/Firmware-Compile%20Tested%20(No%20Hardware%20Test)-orange?style=for-the-badge&logo=platformio&logoColor=white)](firmware/)
 
 **Precision 6-Thruster Control Firmware & Underwater Digital Twin Simulation Suite**
 
@@ -23,7 +23,7 @@
 
 <div align="center">
 
-| 3D Digital Twin (Three.js & CAD Mesh) | 2D Fossen Hydrodynamics & Wave Engine |
+| 3D Digital Twin (Three.js & CAD Mesh) | Experimental Reduced 2D Motion Model |
 | :---: | :---: |
 | <img src="docs/images/sim3d_view.png" alt="3D Simulation" width="460"/> | <img src="docs/images/sim2d_view.png" alt="2D Simulation" width="460"/> |
 
@@ -40,6 +40,7 @@
 - [Key Features](#key-features)
 - [Hardware Pinout & Thruster Geometry](#hardware-pinout--thruster-geometry)
 - [Digital Twin Simulation Guide](#digital-twin-simulation-guide)
+- [Hardware-in-the-Loop Bench Guide](docs/guides/HIL_GUIDE.md)
 - [Serial CLI Command Reference](#serial-cli-command-reference)
 - [Autonomous Mission Format (`/jalur.json`)](#autonomous-mission-format-jalurjson)
 - [Testing & Flashing Tools](#testing--flashing-tools)
@@ -49,18 +50,20 @@
 
 ## 📌 System Overview
 This project implements a **hierarchical dual-rate control architecture**:
-1. **Embedded Fast-Loop (RP2040 @ 50 Hz / 20 ms):** Deterministic bare-metal C++ microcontroller firmware completely stripped of Wi-Fi/web server overhead, dedicating 100% of clock cycles to microsecond-accurate PWM generation, sensor fusion (MPU-6050 & MS5803), closed-loop PID attitude stabilization, and LittleFS autonomous mission execution.
-2. **Companion Digital Twin (Host PC @ 60 FPS / Port 8080):** Interactive web-based 2D/3D Fossen hydrodynamic simulator supporting both standalone SIL (*Software-in-the-Loop*) and live HIL (*Hardware-in-the-Loop* via USB serial `COM4 @ 115200 baud`).
+1. **Embedded Control Loop (RP2040, nominal 50 Hz / 20 ms):** C++ firmware generates PWM, reads the MPU-6050/MS5803 sensors, runs available PID loops, and executes LittleFS missions without a host-network dependency. Timing and actuator behavior still require verification on the target hardware.
+2. **Companion Simulator (Host PC / Port 8080):** Experimental web digital twin for visualization and software testing. This reduced model is not a validated Fossen model or evidence of hardware safety; the server accepts local connections only.
 
 ---
 
 ## 🌟 Key Features
-1. **Deterministic 50 Hz Control Loop:** Zero network jitter ensures ESC PWM pulses remain active and uninterrupted.
-2. **6-Thruster Vectored Layout:** 4 horizontal thrusters at 45° angles (X-vector) for surge, sway, and yaw, plus 2 vertical thrusters for heave, pitch, and roll.
-3. **Nonlinear Fossen Hydrodynamic Physics:** Models dry mass ($14.5\text{ kg}$), added mass, quadratic drag, metacentric righting moments, positive net buoyancy (+150g fail-to-float safety), and Airy linear wave disturbances.
-4. **Closed-Loop PID Attitude Stabilization:** Active stabilization for *Depth Hold*, *Roll Leveling*, and *Pitch Leveling*.
+1. **Nominal 50 Hz Control Loop:** Firmware is configured for a 20 ms control period; no timing or hardware-safety certification is implied.
+2. **6-Thruster Vectored Layout:** 4 horizontal thrusters for surge, sway, and yaw; two vertical thrusters for heave and roll per the firmware mixer. Pitch control is disabled until geometry and actuator authority are physically verified.
+3. **Experimental Simulation Model:** A reduced digital-twin model for visualization and software testing, not hydrodynamic validation or hardware tuning evidence.
+4. **PID Stabilization:** Active *Depth Hold* and *Roll Leveling*; pitch is unsupported.
 5. **LittleFS Mission Trajectory Engine:** Executes scripted `/jalur.json` missions with support for English and Indonesian navigation aliases (`dive`, `forward`, `backward`, `turn`, `sway_left`, `sway_right`, `hover`, `surface`).
-6. **Hardware Protection & Failsafes:** Global **25% default power ceiling** for bench safety, ESC deadband jump compensation ($25\ \mu\text{s}$), and 500 ms serial watchdog failsafe.
+6. **Hardware Protection & Failsafes:** **25% default power limit**, sensor preflight before missions/PID, and mission abort if simulation sensor injection is lost for more than 500 ms.
+
+> **Hardware validation required:** Thruster rotation/polarity in the table describes firmware defaults, not physically verified thrust direction. Remove propellers for initial direction checks and use an independent physical power cutoff.
 
 ---
 
@@ -73,7 +76,7 @@ This project implements a **hierarchical dual-rate control architecture**:
          (GP4, CCW)      ╲          ╱     (GP3, CW)
                           ┌────────┐
         [T6: Vert-Left]   │ RP2040 │  [T5: Vert-Right]
-           (GP7, CW)      │ PICO W │     (GP6, CCW)
+          (GP7, CCW)      │ PICO W │     (GP6, CW)
                           └────────┘
       [T1: Rear-Left]   ╱          ╲ [T4: Rear-Right]
           (GP2, CW)    ╱            ╲    (GP5, CCW)
@@ -87,8 +90,8 @@ This project implements a **hierarchical dual-rate control architecture**:
 | **Thruster 2 (T2)** | **GP3** | CW (Reverse: 1) | Horizontal vector front-right (45°), surge/yaw |
 | **Thruster 3 (T3)** | **GP4** | CCW (Reverse: 0) | Horizontal vector front-left (45°), surge/yaw |
 | **Thruster 4 (T4)** | **GP5** | CCW (Reverse: 0) | Horizontal vector rear-right (45°), surge/yaw |
-| **Thruster 5 (T5)** | **GP6** | CCW (Reverse: 0) | Vertical heave mid-right, heave/depth, roll trim |
-| **Thruster 6 (T6)** | **GP7** | CW (Reverse: 1) | Vertical heave mid-left, heave/depth, roll trim |
+| **Thruster 5 (T5)** | **GP6** | CW (Reverse: 0) | Vertical heave mid-right, heave/depth, roll |
+| **Thruster 6 (T6)** | **GP7** | CCW (Reverse: 1) | Vertical heave mid-left, heave/depth, roll |
 | **I2C SDA** | **GP26** | Standard I2C Wire1 | MPU-6050 (0x68) & MS5803 (0x76) sensors |
 | **I2C SCL** | **GP27** | Standard I2C Wire1 | MPU-6050 (0x68) & MS5803 (0x76) sensors |
 | **Serial CLI / Telemetry** | **USB** | 115200 baud, 8-N-1 | Interactive CLI & machine packets `$TEL`/`$INJ` |
@@ -109,11 +112,17 @@ python app.py
 ```
 Open your browser at **`http://localhost:8080`**. The interface provides 6 control tabs:
 * **🏠 Home / Dashboard:** Live attitude telemetry, depth, pressure, 6-thruster PWM meters, and arming state.
-* **🌊 Simulasi 2D & 3D:** Three.js competition pool ($12\text{m} \times 5\text{m} \times 2\text{m}$) with PVC gate, dynamic thrust arrows, animated caustics, and 2D Fossen physics canvas.
+* **🌊 Simulasi 2D & 3D:** Three.js competition pool ($12\text{m} \times 5\text{m} \times 2\text{m}$) with PVC gate, dynamic thrust arrows, animated caustics, and an experimental reduced planar motion canvas.
 * **⚙️ Konfigurasi:** Actuator trim settings, ESC deadband, thruster reverse flags, and PID gains.
 * **🎯 Kalibrasi Sensor:** One-touch zero depth tare and IMU leveling calibration.
 * **🗺️ Pembuat Jalur:** Visual waypoint trajectory designer with direct serial upload to LittleFS.
 * **💻 Terminal Hardware:** Web serial ANSI terminal connected directly to the RP2040.
+
+The configuration launcher `start_konfigurasi.bat` opens the **Konfigurasi** tab in the unified app at **`http://localhost:8080/#konfigurasi`**. The old `config.html` page redirects there; the legacy server on port 8081 is no longer used. The application binds to loopback only. Remove propellers and use an independent physical cutoff for any bench procedure.
+
+For sealed-hull setup, firmware provides an optional **Wi-Fi AP + UDP JSON configuration/control channel** and an authenticated HTTP firmware-update endpoint. The dashboard's Python server relays a compiled Pico W `.bin` to that endpoint; it does not flash the Pico directly. The OTA-capable firmware must first be installed once over USB/BOOTSEL. Subsequent OTA uploads require the AP password, LittleFS staging space, and an idle/disarmed device with Auto-Run disabled; control/telemetry pauses while the image is written and the Pico restarts. UF2 remains the BOOTSEL recovery format. Configure a private password locally using `src/wireless_secrets.example.h` before building. Wi-Fi setup/update is for above-water bench use, not underwater control or emergency stop. The Android parameter client still uses UDP; see [ANDROID_PARAMETER_APP_PROMPT.md](docs/development/ANDROID_PARAMETER_APP_PROMPT.md) for protocol details and the [Arduino-Pico OTA guide](https://arduino-pico.readthedocs.io/en/latest/ota.html) for the bootloader model.
+
+For the explicit, output-limited Pico W actuator HIL workflow and its physical bench precautions, see the [Hardware-in-the-Loop bench guide](docs/guides/HIL_GUIDE.md).
 
 ---
 
@@ -122,12 +131,12 @@ Connect any serial terminal at **115200 baud**:
 * `status` / `stat`: Displays complete system dashboard.
 * `sensor stream`: Streams live attitude and depth data (press any key to stop).
 * `telem on [hz]`: Enables non-blocking `$TEL` machine telemetry packets (default: 10 Hz).
-* `tes <1-6|all> <power>`: Spins motor(s) for 2.0s at specified power percentage.
-* `esc calib`: Runs automated 3-phase ESC throttle calibration (2000µs $\to$ 1000µs $\to$ 1500µs).
+* `tes <1-6|all> <power>`: Spins motor(s) for 2.0s at specified power percentage; idle-disarmed only.
+* `esc calib`: Runs automated 3-phase ESC throttle calibration (2000µs $\to$ 1000µs $\to$ 1500µs); idle-disarmed only.
 * `calib zero`: Locks current atmospheric pressure as surface depth reference (0 cm).
 * `calib level`: Zeroes IMU tilt offsets (0.0°/0.0°).
 * `pid on` / `pid off`: Enables or disables active closed-loop stabilization.
-* `pid <axis> <kp> <ki> <kd>`: Sets PID constants for `depth`, `roll`, or `pitch`.
+* `pid <axis> <kp> <ki> <kd>`: Sets PID constants for `depth` or `roll`; pitch is disabled until actuator authority is verified.
 * `save`: Commits settings and calibrations to EEPROM with FNV-1a checksum.
 * `stop`: **EMERGENCY STOP**, immediately neutralizes all thrusters to 1500 µs.
 
@@ -166,6 +175,10 @@ pio run              # Compile C++ firmware
 pio run -t upload    # Upload to Pico W via USB
 pio device monitor -b 115200 # Open serial monitor
 ```
+After setting the local private Wi-Fi password, build again and use
+`.pio/build/picow/firmware.uf2` for the one-time BOOTSEL install; select the
+matching `.pio/build/picow/firmware.bin` in the dashboard for later OTA updates.
+Do not distribute firmware images built with a private AP password.
 
 ---
 
@@ -184,20 +197,24 @@ auv-6thruster-rev-0.1/
 │   ├── mission.h / mission.cpp   # LittleFS /jalur.json autonomous trajectory engine
 │   └── cli.h / cli.cpp           # ANSI terminal CLI & isolated machine protocol
 │
-├── firmware/                     # Verified binary files
-│   ├── firmware_rev0.1.uf2       # USB BOOTSEL drag-and-drop binary (835 KB)
-│   └── firmware_rev0.1.bin       # Direct binary flashing file (417 KB)
+├── android-config/                # Android client for Pico W parameter UDP
+├── firmware/                     # Compiled release images (hardware unverified)
+│   ├── firmware_rev0.1.uf2       # USB BOOTSEL drag-and-drop image (848 KB)
+│   └── firmware_rev0.1.bin       # Direct binary image (424 KB)
 │
 ├── simulasi_auv/                 # Digital Twin & Web Control Center
 │   ├── app.py                    # Companion Python server & serial bridge (Port 8080)
-│   ├── rl_agent.py               # Adaptive RL-PID tuning module
+│   ├── rl_agent.py               # Experimental stochastic PID gain search
 │   ├── index.html                # 6-tab industrial dark theme web dashboard
-│   ├── hydrodynamics.js          # 2D Fossen physics & Airy wave engine
+│   ├── ui.css                    # Shared dashboard styles
+│   ├── hydrodynamics.js          # Experimental reduced planar motion model
 │   ├── sim3d.js                  # Three.js 3D underwater simulation
-│   ├── start.bat                 # One-click Windows launcher
+│   ├── config.html, server.py    # Legacy redirects; no second control backend
+│   ├── start*.bat / start*.py    # Windows app and settings launchers
 │   ├── assets/                   # Authentic CAD STL 3D model & robot sprites
 │   └── libs/                     # Three.js r128, OrbitControls, STLLoader
 │
+├── tests/                        # Python and JavaScript regression tests
 ├── tools/                        # Flashing & testing utilities
 │   ├── flash_and_verify.py       # Primary automated flash & test script
 │   ├── flash_and_test_v6.py      # Schema v6 regression test

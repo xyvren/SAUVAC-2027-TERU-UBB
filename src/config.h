@@ -4,11 +4,13 @@
 #include <EEPROM.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
+#include <string.h>
 
 namespace Config {
 
 constexpr uint32_t CONFIG_MAGIC = 0x41555631;  // 'AUV1'
-constexpr uint8_t CONFIG_VERSION = 6;
+constexpr uint8_t CONFIG_VERSION = 8;
 constexpr size_t THRUSTER_COUNT = 6;
 constexpr size_t AXIS_COUNT = 6;  // Surge, Sway, Heave, Yaw, Pitch, Roll
 
@@ -113,8 +115,57 @@ struct Settings {
   float diffHorizTrim;      // Differential trim Port (T1, T3) vs Starboard (T2, T4) (-20.0 to +20.0, default 0.0)
   float diffVertTrim;       // Differential trim T5 vs T6 (-20.0 to +20.0, default 0.0)
 
+  uint8_t autoDepthTareOnBoot;  // Capture surface pressure at startup
+  uint8_t autoImuLevelOnBoot;   // Capture level IMU offsets at startup
+
   uint32_t checksum;
 };
+
+inline bool validPidGains(const PidGains& gains) {
+  constexpr float MAX_PID_GAIN = 100.0f;
+  return isfinite(gains.kp) && isfinite(gains.ki) && isfinite(gains.kd) &&
+      gains.kp >= 0.0f && gains.kp <= MAX_PID_GAIN &&
+      gains.ki >= 0.0f && gains.ki <= MAX_PID_GAIN &&
+      gains.kd >= 0.0f && gains.kd <= MAX_PID_GAIN;
+}
+
+inline bool validSettings(const Settings& s) {
+  if (s.powerLimitPercent < 1 || s.powerLimitPercent > 100 ||
+      !isfinite(s.waterDensity) || s.waterDensity < 800.0f || s.waterDensity > 1200.0f ||
+      !isfinite(s.pitchOffset) || fabsf(s.pitchOffset) > 90.0f ||
+      !isfinite(s.rollOffset) || fabsf(s.rollOffset) > 90.0f ||
+      !isfinite(s.depthZeroPressureMbar) || s.depthZeroPressureMbar < 500.0f ||
+      s.depthZeroPressureMbar > 2000.0f || s.depthZeroCalibrated > 1 ||
+      s.autoRunEnabled > 1 || s.autoRunDelaySec < 3 || s.autoRunDelaySec > 60 ||
+      s.autoRunTareSec < 1 || s.autoRunTareSec > s.autoRunDelaySec ||
+      s.autoRunLevelSec < 1 || s.autoRunLevelSec > s.autoRunDelaySec ||
+      s.autoDepthTareOnBoot > 1 || s.autoImuLevelOnBoot > 1 ||
+      s.escDeadbandUs > 80 || !isfinite(s.diffHorizTrim) ||
+      fabsf(s.diffHorizTrim) > 20.0f || !isfinite(s.diffVertTrim) ||
+      fabsf(s.diffVertTrim) > 20.0f ||
+      !validPidGains(s.pidDepth) || !validPidGains(s.pidRoll) ||
+      !validPidGains(s.pidPitch)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
+    const ThrusterConfig& t = s.thrusters[i];
+    if (t.pin > 29 || t.pin == I2C_SDA_PIN || t.pin == I2C_SCL_PIN ||
+        t.pulseMin < 800 || t.pulseMin > 1400 ||
+        t.pulseNeutral < 1400 || t.pulseNeutral > 1600 ||
+        t.pulseMax < 1600 || t.pulseMax > 2200 ||
+        t.pulseMin >= t.pulseNeutral || t.pulseNeutral >= t.pulseMax ||
+        t.reverse > 1 || !isfinite(t.trim) || t.trim < 0.1f || t.trim > 2.5f) {
+      return false;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (s.thrusters[j].pin == t.pin) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 inline uint32_t calculateChecksum(const Settings& s) {
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&s);
@@ -126,6 +177,7 @@ inline uint32_t calculateChecksum(const Settings& s) {
 }
 
 inline void loadDefaults(Settings& s) {
+  memset(&s, 0, sizeof(s));
   s.magic = CONFIG_MAGIC;
   s.version = CONFIG_VERSION;
   s.powerLimitPercent = DEFAULT_POWER_LIMIT_PERCENT;
@@ -161,6 +213,8 @@ inline void loadDefaults(Settings& s) {
   s.autoRunDelaySec = 10;
   s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
   s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+  s.autoDepthTareOnBoot = 0;
+  s.autoImuLevelOnBoot = 0;
 
   s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
   s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
@@ -170,6 +224,9 @@ inline void loadDefaults(Settings& s) {
 }
 
 inline bool saveSettings(Settings& s) {
+  if (!validSettings(s)) {
+    return false;
+  }
   s.magic = CONFIG_MAGIC;
   s.version = CONFIG_VERSION;
   s.checksum = calculateChecksum(s);
@@ -183,56 +240,39 @@ inline bool loadSettings(Settings& s) {
   EEPROM.get(0, s);
   if (s.magic == CONFIG_MAGIC && s.version == CONFIG_VERSION &&
       s.checksum == calculateChecksum(s)) {
-    // Validate bounds
-    if (s.powerLimitPercent < 1 || s.powerLimitPercent > 100) {
-      s.powerLimitPercent = DEFAULT_POWER_LIMIT_PERCENT;
-    }
-    if (s.waterDensity < 800.0f || s.waterDensity > 1200.0f) {
-      s.waterDensity = 1000.0f;
-    }
-    if (s.autoRunDelaySec < 3 || s.autoRunDelaySec > 60) {
-      s.autoRunDelaySec = 10;
-    }
-    if (s.autoRunTareSec < 1 || s.autoRunTareSec > 30) {
-      s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
-    }
-    if (s.autoRunLevelSec < 1 || s.autoRunLevelSec > 30) {
-      s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
-    }
-    if (s.autoRunEnabled > 1) {
-      s.autoRunEnabled = 0;
-    }
-    if (s.escDeadbandUs > 80) {
-      s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
-    }
-    if (s.diffHorizTrim < -20.0f || s.diffHorizTrim > 20.0f) {
-      s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
-    }
-    if (s.diffVertTrim < -20.0f || s.diffVertTrim > 20.0f) {
-      s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
-    }
-    for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
-      if (s.thrusters[i].pulseMin < 800 || s.thrusters[i].pulseMin > 1400) {
-        s.thrusters[i].pulseMin = DEFAULT_PULSE_MIN_US;
-      }
-      if (s.thrusters[i].pulseNeutral < 1400 || s.thrusters[i].pulseNeutral > 1600) {
-        s.thrusters[i].pulseNeutral = DEFAULT_PULSE_NEUTRAL_US;
-      }
-      if (s.thrusters[i].pulseMax < 1600 || s.thrusters[i].pulseMax > 2200) {
-        s.thrusters[i].pulseMax = DEFAULT_PULSE_MAX_US;
-      }
-      if (s.thrusters[i].trim < 0.1f || s.thrusters[i].trim > 2.5f) {
-        s.thrusters[i].trim = 1.00f;
-      }
+    if (!validSettings(s)) {
+      loadDefaults(s);
+      return false;
     }
     return true;
   }
 
-  // Automatic EEPROM Schema Migration (v5 -> v6)
+  // Automatic EEPROM Schema Migration (v7 -> v8)
+  if (s.magic == CONFIG_MAGIC && s.version == 7) {
+    const uint8_t calibrateOnBoot = s.autoDepthTareOnBoot;
+    s.version = CONFIG_VERSION;
+    s.autoDepthTareOnBoot = calibrateOnBoot;
+    s.autoImuLevelOnBoot = calibrateOnBoot;
+    saveSettings(s);
+    return true;
+  }
+
+  // Automatic EEPROM Schema Migration (v6 -> v8)
+  if (s.magic == CONFIG_MAGIC && s.version == 6) {
+    s.version = CONFIG_VERSION;
+    s.autoDepthTareOnBoot = 0;
+    s.autoImuLevelOnBoot = 0;
+    saveSettings(s);
+    return true;
+  }
+
+  // Automatic EEPROM Schema Migration (v5 -> v8)
   if (s.magic == CONFIG_MAGIC && s.version == 5) {
     s.version = CONFIG_VERSION;
     s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
     s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+    s.autoDepthTareOnBoot = 0;
+    s.autoImuLevelOnBoot = 0;
     s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
     s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
     s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;
@@ -240,7 +280,7 @@ inline bool loadSettings(Settings& s) {
     return true;
   }
 
-  // Automatic EEPROM Schema Migration (v4 -> v6)
+  // Automatic EEPROM Schema Migration (v4 -> v8)
   if (s.magic == CONFIG_MAGIC && s.version == 4) {
     s.version = CONFIG_VERSION;
     for (size_t i = 0; i < THRUSTER_COUNT; ++i) {
@@ -248,6 +288,8 @@ inline bool loadSettings(Settings& s) {
     }
     s.autoRunTareSec = DEFAULT_AUTORUN_TARE_SEC;
     s.autoRunLevelSec = DEFAULT_AUTORUN_LEVEL_SEC;
+    s.autoDepthTareOnBoot = 0;
+    s.autoImuLevelOnBoot = 0;
     s.escDeadbandUs = DEFAULT_ESC_DEADBAND_US;
     s.diffHorizTrim = DEFAULT_DIFF_HORIZ_TRIM;
     s.diffVertTrim = DEFAULT_DIFF_VERT_TRIM;

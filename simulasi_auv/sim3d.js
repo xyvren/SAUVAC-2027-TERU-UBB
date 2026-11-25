@@ -45,8 +45,8 @@
     causticsCtx: null,
 
     // States & Options
-    cameraFollow: true,
-    activeCameraPreset: 'chase', // 'chase', 'side', 'top', 'front', 'gate', 'free'
+    cameraFollow: false,
+    activeCameraPreset: 'pool', // 'pool', 'chase', 'side', 'top', 'front', 'gate', 'free'
     cadLoaded: false,
     modelMode: 'cad', // 'cad', 'procedural', 'hybrid'
     showThrustVectors: true,
@@ -59,6 +59,7 @@
     clock: null,
     lastFrameTime: 0,
     causticsCounter: 0,
+    animationCallback: null,
 
     // Thruster Mounting Coordinates (Local Robot Space, in meters)
     // Authentic 6-Thruster Kinematics & Polarities (Matching SAUVAC hardware & rov_config.h)
@@ -73,8 +74,8 @@
       { id: 'T2', name: 'Front-Right (T2)', pos: [0.217, 0.059, 0.262], yaw: 3 * Math.PI / 4, pitch: 0, type: 'horiz', bladeCw: true, reverse: 1, color: 0xfbbf24 },
       { id: 'T3', name: 'Front-Left (T3)', pos: [0.217, 0.062, -0.261], yaw: Math.PI / 4, pitch: 0, type: 'horiz', bladeCw: false, reverse: 0, color: 0x38bdf8 },
       { id: 'T4', name: 'Rear-Right (T4)', pos: [-0.213, 0.061, 0.259], yaw: 3 * Math.PI / 4, pitch: 0, type: 'horiz', bladeCw: false, reverse: 0, color: 0x38bdf8 },
-      { id: 'T5', name: 'Mid-Left Vert (T5)', pos: [-0.020, 0.080, -0.220], yaw: 0, pitch: Math.PI / 2, type: 'vert', bladeCw: false, reverse: 1, color: 0x38bdf8 },
-      { id: 'T6', name: 'Mid-Right Vert (T6)', pos: [-0.020, 0.080, 0.220], yaw: 0, pitch: Math.PI / 2, type: 'vert', bladeCw: true, reverse: 0, color: 0xfbbf24 }
+      { id: 'T5', name: 'Mid-Right Vert (T5)', pos: [-0.020, 0.080, 0.220], yaw: 0, pitch: Math.PI / 2, type: 'vert', bladeCw: true, reverse: 0, color: 0xfbbf24 },
+      { id: 'T6', name: 'Mid-Left Vert (T6)', pos: [-0.020, 0.080, -0.220], yaw: 0, pitch: Math.PI / 2, type: 'vert', bladeCw: false, reverse: 1, color: 0x38bdf8 }
     ]
   };
 
@@ -100,19 +101,33 @@
 
     // 1. Scene & Underwater Fog Setup
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x031220); // Deep underwater dark blue
-    this.scene.fog = new THREE.FogExp2(0x041829, 0.075); // Volumetric water attenuation
+    this.scene.background = new THREE.Color(0x102b39);
+    this.scene.fog = new THREE.FogExp2(0x2a5968, 0.018);
 
     // 2. Camera Setup
     this.camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 100.0);
-    this.camera.position.set(-2.0, 0.6, 2.2);
+    this.camera.position.set(15.0, 8.5, 11.0);
 
     // 3. High-Performance WebGL Renderer
-    this.renderer = new THREE.WebGLRenderer({
-      powerPreference: 'high-performance',
-      antialias: true,
-      alpha: true
-    });
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        powerPreference: 'high-performance',
+        antialias: true,
+        alpha: true
+      });
+    } catch (error) {
+      this.initialized = false;
+      this.container.innerHTML =
+        '<div style="height:100%;display:grid;place-items:center;text-align:center;color:#f87171;padding:24px">' +
+        '<div><strong>WebGL 3D tidak dapat dimulai</strong><br><small>' +
+        'Aktifkan hardware/WebGL pada browser, update driver GPU, atau buka aplikasi di Chromium/Edge.' +
+        '</div></div>';
+      console.error('[Sim3D] WebGL renderer unavailable:', error);
+      window.Sim3DWebGLError = error;
+      return;
+    }
+    this.renderer = renderer;
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -129,14 +144,19 @@
       this.controls.enableDamping = true;
       this.controls.dampingFactor = 0.07;
       this.controls.minDistance = 0.6;
-      this.controls.maxDistance = 22.0;
+      this.controls.maxDistance = 30.0;
       this.controls.maxPolarAngle = Math.PI / 2 + 0.08; // Keep camera inside/above pool water
-      this.controls.target.set(1.0, -0.5, 0.0);
+      this.controls.target.set(6.0, -0.8, 0.0);
 
-      // Disable follow cam if user initiates manual mouse drag
       this.controls.addEventListener('start', () => {
-        if (Sim3D.activeCameraPreset !== 'free') {
-          // Keep tracking target but let user angle camera freely
+        if (Sim3D.cameraFollow) {
+          Sim3D.cameraFollow = false;
+          Sim3D.activeCameraPreset = 'free';
+          const followButton = document.getElementById('btn3dFollow');
+          if (followButton) followButton.textContent = 'Ikuti kamera: mati';
+          document.querySelectorAll('.cam-preset-btn').forEach(btn => btn.classList.remove('active'));
+          const freeButton = document.getElementById('btnCamFree');
+          if (freeButton) freeButton.classList.add('active');
         }
       });
     }
@@ -151,6 +171,7 @@
 
     // 7. Build Robot Model Hierarchies
     this.buildRobotGroup();
+    this.setCameraPreset('pool');
 
     // 8. Build Cavitation Particle Engine
     this.buildCavitationSystem();
@@ -158,8 +179,9 @@
     // 9. Load Authentic CAD STL Asset Asynchronously
     this.loadAuthenticCadStl();
 
-    // 10. Start Animation Loop Immediately (Unconditional loop safety)
-    this.renderer.setAnimationLoop(this.animate.bind(this));
+    // Render while the viewport is visible and the simulation is running.
+    this.animationCallback = this.animate.bind(this);
+    document.addEventListener('visibilitychange', () => this.syncAnimationState());
 
     // 11. Window Resize Handling
     window.addEventListener('resize', this.onResize.bind(this));
@@ -169,7 +191,24 @@
     }
 
     this.initialized = true;
+    window.Sim3DReady = true;
+    this.onResize();
+    this.syncAnimationState();
     console.log('[Sim3D] AUV SAUVAC 3D Digital Twin Engine successfully initialized.');
+  };
+
+  Sim3D.syncAnimationState = function () {
+    if (!this.renderer || !this.container || !this.animationCallback) return;
+    const tabVisible = !document.querySelector('#tab-simulasi') ||
+      document.querySelector('#tab-simulasi').classList.contains('active');
+    const viewportVisible = this.container.isConnected &&
+      this.container.getClientRects().length > 0 &&
+      getComputedStyle(this.container).display !== 'none';
+    const visible = document.visibilityState === 'visible' &&
+      tabVisible &&
+      viewportVisible;
+    this.renderer.setAnimationLoop(visible ? this.animationCallback : null);
+    if (visible) this.animate();
   };
 
   /**
@@ -177,21 +216,21 @@
    */
   Sim3D.setupLighting = function () {
     // Soft cyan ambient fill
-    const ambientLight = new THREE.AmbientLight(0x0b2d45, 1.4);
+    const ambientLight = new THREE.AmbientLight(0x7ca9b8, 1.35);
     this.scene.add(ambientLight);
 
     // Sunlight from pool surface
-    const sunLight = new THREE.DirectionalLight(0xa5f3fc, 1.8);
+    const sunLight = new THREE.DirectionalLight(0xd8f4ff, 2.1);
     sunLight.position.set(6.0, 8.0, 2.0);
     this.scene.add(sunLight);
 
     // Front/Side fill light
-    const fillLight = new THREE.DirectionalLight(0x0284c7, 0.9);
+    const fillLight = new THREE.DirectionalLight(0x37a9c5, 0.75);
     fillLight.position.set(6.0, -1.0, -6.0);
     this.scene.add(fillLight);
 
     // Under-robot upward soft bounce
-    const bounceLight = new THREE.DirectionalLight(0x0e7490, 0.5);
+    const bounceLight = new THREE.DirectionalLight(0x3b889b, 0.45);
     bounceLight.position.set(6.0, -4.0, 0.0);
     this.scene.add(bounceLight);
   };
@@ -206,7 +245,7 @@
     const ctx = canvas.getContext('2d');
 
     // Olympic blue base
-    ctx.fillStyle = '#08253d';
+    ctx.fillStyle = '#16455a';
     ctx.fillRect(0, 0, 512, 512);
 
     const tileSize = 32;
@@ -214,11 +253,11 @@
       for (let x = 0; x < 512; x += tileSize) {
         // Subtle color variation per tile
         const shade = Math.floor(Math.random() * 14);
-        ctx.fillStyle = `rgb(${7 + shade}, ${36 + shade * 2}, ${62 + shade * 3})`;
+        ctx.fillStyle = `rgb(${22 + shade}, ${66 + shade * 2}, ${91 + shade * 3})`;
         ctx.fillRect(x + 1, y + 1, tileSize - 2, tileSize - 2);
 
         // Grout line
-        ctx.strokeStyle = '#041421';
+        ctx.strokeStyle = '#0c2e3b';
         ctx.lineWidth = 1;
         ctx.strokeRect(x + 0.5, y + 0.5, tileSize - 1, tileSize - 1);
       }
@@ -238,18 +277,27 @@
     this.poolGroup = new THREE.Group();
     this.scene.add(this.poolGroup);
 
-    // 1. Pool Floor (Y = -2.0m, X = 0..12m, Z = -2.5..+2.5m)
+    // 1. Tiled pool floor and a solid concrete base.
     const floorGeo = new THREE.PlaneGeometry(12.0, 5.0);
     const floorTex = this.createTileTexture();
     const floorMat = new THREE.MeshStandardMaterial({
       map: floorTex,
-      roughness: 0.65,
-      metalness: 0.2
+      roughness: 0.78,
+      metalness: 0.02
     });
     const floorMesh = new THREE.Mesh(floorGeo, floorMat);
     floorMesh.rotation.x = -Math.PI / 2;
     floorMesh.position.set(6.0, -2.0, 0.0);
     this.poolGroup.add(floorMesh);
+
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: 0x225062,
+      roughness: 0.88,
+      metalness: 0.02
+    });
+    const floorBase = new THREE.Mesh(new THREE.BoxGeometry(12.16, 0.18, 5.16), baseMat);
+    floorBase.position.set(6.0, -2.09, 0.0);
+    this.poolGroup.add(floorBase);
 
     // 2. Center Olympic Lane Line (Black Line on floor along Z = 0)
     const laneGeo = new THREE.PlaneGeometry(11.0, 0.24);
@@ -275,41 +323,37 @@
       this.poolGroup.add(crossMesh);
     }
 
-    // 3. Pool Walls
+    // 3. Full-height structural walls give the basin visible depth and thickness.
     const wallMat = new THREE.MeshStandardMaterial({
-      color: 0x0c314b,
-      roughness: 0.5,
-      metalness: 0.1
+      color: 0x3b7280,
+      roughness: 0.72,
+      metalness: 0.04
     });
 
-    // Back Wall (Z = +2.5m, looking into pool)
-    const backWallGeo = new THREE.PlaneGeometry(12.0, 2.0);
+    const backWallGeo = new THREE.BoxGeometry(12.0, 2.0, 0.16);
     const backWall = new THREE.Mesh(backWallGeo, wallMat);
     backWall.position.set(6.0, -1.0, 2.5);
-    backWall.rotation.y = Math.PI;
     this.poolGroup.add(backWall);
 
-    // Start Wall (X = 0m, 5m wide x 2m deep)
-    const startWallGeo = new THREE.PlaneGeometry(5.0, 2.0);
+    const startWallGeo = new THREE.BoxGeometry(0.16, 2.0, 5.0);
     const startWall = new THREE.Mesh(startWallGeo, wallMat);
     startWall.position.set(0.0, -1.0, 0.0);
-    startWall.rotation.y = Math.PI / 2;
     this.poolGroup.add(startWall);
 
-    // End Wall (X = 12m)
     const endWall = new THREE.Mesh(startWallGeo, wallMat);
     endWall.position.set(12.0, -1.0, 0.0);
-    endWall.rotation.y = -Math.PI / 2;
     this.poolGroup.add(endWall);
 
-    // Front Wall (Z = -2.5m): Semi-transparent underwater viewing glass
-    const frontWallGeo = new THREE.PlaneGeometry(12.0, 2.0);
+    // Front viewing wall uses a thin glass shell rather than an opaque plane.
+    const frontWallGeo = new THREE.BoxGeometry(12.0, 2.0, 0.12);
     const glassMat = new THREE.MeshPhysicalMaterial({
-      color: 0x0284c7,
+      color: 0x4ab6ce,
       transparent: true,
-      opacity: 0.12,
-      roughness: 0.1,
-      metalness: 0.05,
+      opacity: 0.20,
+      roughness: 0.14,
+      metalness: 0.02,
+      transmission: 0.55,
+      depthWrite: false,
       side: THREE.DoubleSide
     });
     const frontWall = new THREE.Mesh(frontWallGeo, glassMat);
@@ -317,7 +361,7 @@
     this.poolGroup.add(frontWall);
 
     // 4. Pool Perimeter Coping / Rim (Deck edge at Y = 0 to 0.1m)
-    const rimMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.8 });
+    const rimMat = new THREE.MeshStandardMaterial({ color: 0x385560, roughness: 0.82 });
     const rimGeoLong = new THREE.BoxGeometry(12.4, 0.15, 0.3);
     const rimBack = new THREE.Mesh(rimGeoLong, rimMat);
     rimBack.position.set(6.0, 0.075, 2.65);
@@ -336,14 +380,34 @@
     rimEnd.position.set(12.15, 0.075, 0.0);
     this.poolGroup.add(rimEnd);
 
+    // Concrete walkways make the pool read as a built basin rather than a floating plane.
+    const deckMat = new THREE.MeshStandardMaterial({
+      color: 0x52686f,
+      roughness: 0.92,
+      metalness: 0.02
+    });
+    const longDeckGeo = new THREE.BoxGeometry(12.8, 0.16, 0.9);
+    const shortDeckGeo = new THREE.BoxGeometry(0.9, 0.16, 5.8);
+    [-1, 1].forEach(side => {
+      const deck = new THREE.Mesh(longDeckGeo, deckMat);
+      deck.position.set(6.0, 0.08, side * 3.05);
+      this.poolGroup.add(deck);
+    });
+    [-1, 1].forEach(end => {
+      const deck = new THREE.Mesh(shortDeckGeo, deckMat);
+      deck.position.set(end < 0 ? -0.55 : 12.55, 0.08, 0.0);
+      this.poolGroup.add(deck);
+    });
+
     // 5. Water Surface (Y = 0, dynamic wave vertices)
     const waterGeo = new THREE.PlaneGeometry(12.0, 5.0, 64, 28);
     const waterMat = new THREE.MeshPhysicalMaterial({
-      color: 0x0284c7,
+      color: 0x2293ad,
       transparent: true,
-      opacity: 0.52,
-      roughness: 0.1,
-      metalness: 0.15,
+      opacity: 0.42,
+      roughness: 0.24,
+      metalness: 0.02,
+      depthWrite: false,
       side: THREE.DoubleSide
     });
     this.waterMesh = new THREE.Mesh(waterGeo, waterMat);
@@ -577,7 +641,7 @@
     const pGroup = this.proceduralModelGroup;
 
     // Materials
-    const navyHullMat = new THREE.MeshStandardMaterial({
+    const navyHullMat = new THREE.MeshPhysicalMaterial({
       color: 0x0f2b48,
       metalness: 0.5,
       roughness: 0.3,
@@ -722,7 +786,7 @@
       }
 
       // 1. Shroud Nozzle Duct for this thruster (always visible in CAD & procedural modes)
-      const ductMat = new THREE.MeshStandardMaterial({
+      const ductMat = new THREE.MeshPhysicalMaterial({
         color: 0x3b4d61, // Sleek metallic slate grey contrasting sharply with hull
         metalness: 0.85,
         roughness: 0.25,
@@ -875,6 +939,14 @@
    */
   Sim3D.loadAuthenticCadStl = function () {
     const badge = document.getElementById('sim3dStlBadge');
+    if (window.AndroidWifiBridge) {
+      if (badge) {
+        badge.textContent = 'STL: Prosedural (Android)';
+        badge.style.color = 'var(--accent)';
+      }
+      return;
+    }
+
     if (badge) {
       badge.textContent = 'STL: Memuat CAD (19.8MB)...';
       badge.style.color = 'var(--warning)';
@@ -897,10 +969,10 @@
           geometry.computeVertexNormals();
 
           // Authentic Navy Body PBR Material with UBB Accents
-          const stlMat = new THREE.MeshStandardMaterial({
-            color: 0x0f2b48,
-            metalness: 0.65,
-            roughness: 0.32,
+          const stlMat = new THREE.MeshPhysicalMaterial({
+            color: 0x6b8f9c,
+            metalness: 0.28,
+            roughness: 0.46,
             clearcoat: 0.3
           });
 
@@ -963,11 +1035,11 @@
     if (mode === 'cad' && this.cadLoaded) {
       this.cadModelGroup.visible = true;
       this.proceduralModelGroup.visible = false;
-      if (btn) btn.textContent = '📦 Model: Authentic CAD STL';
+      if (btn) btn.textContent = 'Model: CAD STL';
     } else if (mode === 'procedural') {
       this.cadModelGroup.visible = false;
       this.proceduralModelGroup.visible = true;
-      if (btn) btn.textContent = '📦 Model: Prosedural Twin';
+      if (btn) btn.textContent = 'Model: Prosedural';
     } else if (mode === 'hybrid' && this.cadLoaded) {
       this.cadModelGroup.visible = true;
       this.proceduralModelGroup.visible = true;
@@ -975,7 +1047,7 @@
         this.cadMaterial.transparent = true;
         this.cadMaterial.opacity = 0.55;
       }
-      if (btn) btn.textContent = '📦 Model: Hybrid X-Ray';
+      if (btn) btn.textContent = 'Model: Hibrida';
     }
   };
 
@@ -1098,10 +1170,16 @@
     this.activeCameraPreset = preset;
     const robotPos = this.robotGroup ? this.robotGroup.position : new THREE.Vector3(1, -0.5, 0);
 
-    if (preset === 'chase') {
+    if (preset === 'pool') {
+      this.cameraFollow = false;
+      this.camera.position.set(15.0, 8.5, 11.0);
+      if (this.controls) this.controls.target.set(6.0, -0.8, 0.0);
+      const btn = document.getElementById('btn3dFollow');
+      if (btn) btn.textContent = 'Tampak seluruh kolam';
+    } else if (preset === 'chase') {
       this.cameraFollow = true;
       const btn = document.getElementById('btn3dFollow');
-      if (btn) btn.textContent = '🎥 Follow Cam: ON';
+      if (btn) btn.textContent = 'Ikuti kamera: aktif';
     } else if (preset === 'side') {
       this.cameraFollow = false;
       this.camera.position.set(robotPos.x, -1.0, 4.2);
@@ -1121,36 +1199,21 @@
     } else if (preset === 'free') {
       this.cameraFollow = false;
       const btn = document.getElementById('btn3dFollow');
-      if (btn) btn.textContent = '🎥 Follow Cam: OFF';
+      if (btn) btn.textContent = 'Ikuti kamera: mati';
     }
 
+    document.querySelectorAll('.cam-preset-btn').forEach(btn => btn.classList.remove('active'));
+    const activeButton = document.getElementById(`btnCam${preset.charAt(0).toUpperCase() + preset.slice(1)}`);
+    if (activeButton) activeButton.classList.add('active');
     if (this.controls) this.controls.update();
   };
 
   Sim3D.toggleFollowCam = function () {
-    this.cameraFollow = !this.cameraFollow;
-    const btn = document.getElementById('btn3dFollow');
-    if (btn) {
-      btn.textContent = this.cameraFollow ? '🎥 Follow Cam: ON' : '🎥 Follow Cam: OFF';
-    }
-    if (this.cameraFollow) {
-      this.activeCameraPreset = 'chase';
-    }
+    this.setCameraPreset(this.cameraFollow ? 'pool' : 'chase');
   };
 
   Sim3D.resetCamera = function () {
-    this.cameraFollow = true;
-    this.activeCameraPreset = 'chase';
-    const btn = document.getElementById('btn3dFollow');
-    if (btn) btn.textContent = '🎥 Follow Cam: ON';
-
-    const rx = this.robotGroup ? this.robotGroup.position.x : 1.0;
-    const ry = this.robotGroup ? this.robotGroup.position.y : -0.5;
-    this.camera.position.set(rx - 2.2, ry + 0.8, 1.6);
-    if (this.controls) {
-      this.controls.target.set(rx, ry, 0);
-      this.controls.update();
-    }
+    this.setCameraPreset('pool');
   };
 
   /**
@@ -1198,8 +1261,12 @@
 
     // Resolve Active Pulses
     let pulses = [1500, 1500, 1500, 1500, 1500, 1500];
-    if (phys.virtualMissionActive || phys.manualDrive !== 'idle') {
+    if (phys.simulationRunning === false) {
+      pulses = [1500, 1500, 1500, 1500, 1500, 1500];
+    } else if (phys.virtualMissionActive || phys.manualDrive !== 'idle') {
       pulses = phys.virtualPulses || pulses;
+    } else if (Array.isArray(phys.appliedPulses)) {
+      pulses = phys.appliedPulses;
     } else if (appState.pulses) {
       pulses = appState.pulses;
     }
@@ -1301,17 +1368,19 @@
       const rz = this.robotGroup.position.z;
       const yaw = -(phys.yaw * Math.PI) / 180.0;
 
-      // Position camera behind and slightly above the AUV
-      const dist = 2.4;
-      const height = 0.85;
-      const lateral = 0.7;
+      // Keep the chase camera underwater rather than filming the AUV from poolside.
+      const dist = 1.0;
+      const height = -0.35;
+      const lateral = 0.45;
 
-      const idealX = rx - Math.cos(yaw) * dist + Math.sin(yaw) * lateral;
-      const idealZ = rz - Math.sin(yaw) * dist - Math.cos(yaw) * lateral;
-      const idealY = Math.max(-1.8, Math.min(0.6, ry + height));
+      const idealX = Math.max(0.15, Math.min(11.85, rx - Math.cos(yaw) * dist + Math.sin(yaw) * lateral));
+      const idealZ = Math.max(-2.35, Math.min(2.35, rz - Math.sin(yaw) * dist - Math.cos(yaw) * lateral));
+      const idealY = Math.max(-1.8, Math.min(-0.2, ry + height));
+      const targetX = Math.max(0.15, Math.min(11.85, rx + Math.cos(yaw) * 0.5));
+      const targetZ = Math.max(-2.35, Math.min(2.35, rz + Math.sin(yaw) * 0.5));
 
       this.camera.position.lerp(new THREE.Vector3(idealX, idealY, idealZ), 0.06);
-      this.controls.target.lerp(new THREE.Vector3(rx + Math.cos(yaw) * 0.5, ry, rz + Math.sin(yaw) * 0.5), 0.08);
+      this.controls.target.lerp(new THREE.Vector3(targetX, ry, targetZ), 0.08);
       this.controls.update();
     } else if (this.controls) {
       this.controls.update();

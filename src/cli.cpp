@@ -2,6 +2,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 
 namespace CLI {
 
@@ -33,6 +35,7 @@ char machineBuffer[128];
 size_t machineLen = 0;
 bool inMachinePacket = false;
 bool machinePacketJustFinished = false;
+bool machinePacketOverflow = false;
 
 char cliBuffer[128];
 size_t cliLen = 0;
@@ -64,6 +67,13 @@ String fmtFloat(float val, int decimals = 1, int width = 0, bool forceSign = fal
     }
   }
   return s;
+}
+
+bool parseFiniteFloat(const String& text, float& value) {
+  const char* start = text.c_str();
+  char* end = nullptr;
+  value = strtof(start, &end);
+  return end != start && *end == '\0' && isfinite(value);
 }
 
 size_t tokenize(const String& cmd, String tokens[], size_t maxTokens) {
@@ -98,6 +108,12 @@ bool parseBool(const String& str, bool& result) {
   return false;
 }
 
+bool systemIdleDisarmed() {
+  const bool disarmed = !iface.armed || !*iface.armed;
+  const bool idle = !iface.getFsmState || iface.getFsmState() == 0;
+  return disarmed && idle;
+}
+
 void printHelp() {
   Serial.println();
   Serial.print(ANSI_BOLD_CYAN);
@@ -115,6 +131,7 @@ void printHelp() {
   Serial.println(F("  telem [on|off|<hz>]        : $TEL streaming engine (default: 10 Hz)"));
   Serial.println(F("  $POLL or $GET              : Immediate single $TEL telemetry packet reply"));
   Serial.println(F("  stop                       : EMERGENCY STOP: Neutralize all motors immediately"));
+  Serial.println(F("  hil <on|off|status>        : Explicitly arm/disarm limited HIL actuator mode"));
 
   Serial.print(ANSI_BOLD_YELLOW);
   Serial.println(F("\r\n[ AUTONOMOUS MISSION & AUTORUN ]"));
@@ -153,7 +170,7 @@ void printHelp() {
   Serial.println(F("\r\n[ CLOSED-LOOP PID STABILIZATION ]"));
   Serial.print(ANSI_RESET);
   Serial.println(F("  pid <on|off>               : Enable or disable active closed-loop stabilization"));
-  Serial.println(F("  pid <axis> <kp> <ki> <kd>  : Configure PID gains (axis: depth, roll, pitch)"));
+  Serial.println(F("  pid <axis> <kp> <ki> <kd>  : Configure PID gains (axis: depth, roll; pitch unsupported)"));
 
   Serial.print(ANSI_BOLD_YELLOW);
   Serial.println(F("\r\n[ CONFIGURATION & MEMORY ]"));
@@ -321,10 +338,7 @@ void printStatus() {
                 fmtFloat(iface.settings->pidRoll.kp, 3).c_str(),
                 fmtFloat(iface.settings->pidRoll.ki, 3).c_str(),
                 fmtFloat(iface.settings->pidRoll.kd, 3).c_str());
-  Serial.printf("  Pitch : Kp=%s, Ki=%s, Kd=%s\r\n",
-                fmtFloat(iface.settings->pidPitch.kp, 3).c_str(),
-                fmtFloat(iface.settings->pidPitch.ki, 3).c_str(),
-                fmtFloat(iface.settings->pidPitch.kd, 3).c_str());
+  Serial.println(F("  Pitch : UNSUPPORTED (no verified actuator authority)"));
   Serial.println(F("═══════════════════════════════════════════════════════════════════════════════"));
 }
 
@@ -377,7 +391,7 @@ void printSensorSnapshot() {
                 fmtFloat(s.temperatureC, 1, 4).c_str());
 }
 
-void handleCommand(const String& rawCmd) {
+void handleCommandImpl(const String& rawCmd) {
   String cmd = rawCmd;
   cmd.trim();
   if (cmd.startsWith("/")) {
@@ -502,8 +516,8 @@ void handleCommand(const String& rawCmd) {
       return;
     }
 
-    float val = tokens[subIdx + 1].toFloat();
-    if (val < -20.0f || val > 20.0f) {
+    float val = 0.0f;
+    if (!parseFiniteFloat(tokens[subIdx + 1], val) || val < -20.0f || val > 20.0f) {
       Serial.print(ANSI_RED);
       Serial.println(F("ERROR: Differential balance trim must be between -20.0% and +20.0%."));
       Serial.print(ANSI_RESET);
@@ -511,6 +525,10 @@ void handleCommand(const String& rawCmd) {
     }
 
     if (axis == "horiz" || axis == "horizontal") {
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: Balance changes require an idle, disarmed system."));
+        return;
+      }
       iface.settings->diffHorizTrim = val;
       Serial.print(ANSI_GREEN);
       Serial.printf("OK: Differential horizontal trim set to %+.1f%% (Port T1/T3 vs Starboard T2/T4).\r\n", val);
@@ -518,6 +536,10 @@ void handleCommand(const String& rawCmd) {
       Serial.println(F("Type 'save' to commit to EEPROM."));
       return;
     } else if (axis == "vert" || axis == "vertical") {
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: Balance changes require an idle, disarmed system."));
+        return;
+      }
       iface.settings->diffVertTrim = val;
       Serial.print(ANSI_GREEN);
       Serial.printf("OK: Differential vertical trim set to %+.1f%% (T5 vs T6).\r\n", val);
@@ -546,6 +568,10 @@ void handleCommand(const String& rawCmd) {
       Serial.print(ANSI_RED);
       Serial.println(F("ERROR: Power limit must be between 1 and 100%."));
       Serial.print(ANSI_RESET);
+      return;
+    }
+    if (!systemIdleDisarmed()) {
+      Serial.println(F("ERROR: Power-limit changes require an idle, disarmed system."));
       return;
     }
     iface.settings->powerLimitPercent = static_cast<uint8_t>(val);
@@ -610,7 +636,11 @@ void handleCommand(const String& rawCmd) {
     if (powerStr.endsWith("%")) {
       powerStr = powerStr.substring(0, powerStr.length() - 1);
     }
-    float requestedPower = powerStr.toFloat();
+    float requestedPower = 0.0f;
+    if (!parseFiniteFloat(powerStr, requestedPower)) {
+      Serial.println(F("ERROR: Motor power must be a finite number."));
+      return;
+    }
 
     if (!iface.startMotorTest) {
       Serial.println(F("ERROR: Motor test callback unavailable."));
@@ -652,6 +682,10 @@ void handleCommand(const String& rawCmd) {
     }
 
     size_t idx = id - 1;
+    if (!systemIdleDisarmed()) {
+      Serial.println(F("ERROR: Thruster tuning requires an idle, disarmed system."));
+      return;
+    }
     String prop = tokens[2];
     prop.toLowerCase();
     String valStr = tokens[3];
@@ -659,22 +693,22 @@ void handleCommand(const String& rawCmd) {
 
     if (prop == "min") {
       long val = valStr.toInt();
-      if (val < 800 || val > 1400) {
-        Serial.println(F("ERROR: Min pulse must be between 800 and 1400 us."));
+      if (val < 800 || val > 1400 || val >= t.pulseNeutral) {
+        Serial.println(F("ERROR: Min pulse must be 800-1400 us and below the neutral pulse."));
         return;
       }
       t.pulseMin = static_cast<uint16_t>(val);
     } else if (prop == "max") {
       long val = valStr.toInt();
-      if (val < 1600 || val > 2200) {
-        Serial.println(F("ERROR: Max pulse must be between 1600 and 2200 us."));
+      if (val < 1600 || val > 2200 || val <= t.pulseNeutral) {
+        Serial.println(F("ERROR: Max pulse must be 1600-2200 us and above the neutral pulse."));
         return;
       }
       t.pulseMax = static_cast<uint16_t>(val);
     } else if (prop == "neutral") {
       long val = valStr.toInt();
-      if (val < 1400 || val > 1600) {
-        Serial.println(F("ERROR: Neutral pulse must be between 1400 and 1600 us."));
+      if (val < 1400 || val > 1600 || val <= t.pulseMin || val >= t.pulseMax) {
+        Serial.println(F("ERROR: Neutral pulse must be 1400-1600 us and strictly between min and max."));
         return;
       }
       t.pulseNeutral = static_cast<uint16_t>(val);
@@ -686,8 +720,8 @@ void handleCommand(const String& rawCmd) {
       }
       t.reverse = b ? 1 : 0;
     } else if (prop == "trim") {
-      float val = valStr.toFloat();
-      if (val < 0.10f || val > 2.50f) {
+      float val = 0.0f;
+      if (!parseFiniteFloat(valStr, val) || val < 0.10f || val > 2.50f) {
         Serial.println(F("ERROR: Trim scale multiplier must be between 0.10 and 2.50."));
         return;
       }
@@ -724,6 +758,10 @@ void handleCommand(const String& rawCmd) {
         Serial.print(ANSI_RESET);
         return;
       }
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: ESC deadband changes require an idle, disarmed system."));
+        return;
+      }
       iface.settings->escDeadbandUs = static_cast<uint16_t>(db);
       Serial.print(ANSI_GREEN);
       Serial.printf("OK: ESC deadband set to %u us. Type 'save' to commit to EEPROM.\r\n", db);
@@ -747,23 +785,30 @@ void handleCommand(const String& rawCmd) {
       String action = tokens[2];
       action.toLowerCase();
       if (action == "start" || action == "confirm" || action == "run" || action == "y") {
-        if (iface.startEscCalib) {
-          iface.startEscCalib();
-        } else {
-          Serial.println(F("ERROR: ESC calibration routine not attached."));
+        if (!iface.startEscCalib || !iface.startEscCalib()) {
+          Serial.println(F("ERROR: ESC calibration could not start; ensure the system is idle and disarmed."));
         }
         return;
       } else if (action == "max") {
-        if (iface.setRawPulseAll) iface.setRawPulseAll(2000);
-        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MAX (2000us)."));
+        if (iface.setRawPulseAll && iface.setRawPulseAll(2000)) {
+          Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MAX (2000us)."));
+        } else {
+          Serial.println(F("ERROR: Manual ESC output requires an idle, disarmed system."));
+        }
         return;
       } else if (action == "min") {
-        if (iface.setRawPulseAll) iface.setRawPulseAll(1000);
-        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MIN (1000us)."));
+        if (iface.setRawPulseAll && iface.setRawPulseAll(1000)) {
+          Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to MIN (1000us)."));
+        } else {
+          Serial.println(F("ERROR: Manual ESC output requires an idle, disarmed system."));
+        }
         return;
       } else if (action == "neutral" || action == "stop") {
-        if (iface.setRawPulseAll) iface.setRawPulseAll(1500);
-        Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to NEUTRAL (1500us)."));
+        if (iface.setRawPulseAll && iface.setRawPulseAll(1500)) {
+          Serial.println(F("[ESC CALIB] Manual: Setting all thrusters to NEUTRAL (1500us)."));
+        } else {
+          Serial.println(F("ERROR: Thruster outputs are not ready."));
+        }
         return;
       } else {
         Serial.printf("ERROR: Unknown esc calib option '%s'. Use 'start', 'max', 'min', or 'neutral'.\r\n", action.c_str());
@@ -784,9 +829,14 @@ void handleCommand(const String& rawCmd) {
     String action = tokens[1];
     action.toLowerCase();
     if (action == "zero") {
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: Sensor calibration requires an idle, disarmed system."));
+        return;
+      }
       if (tokenCount >= 3) {
-        float manualPres = tokens[2].toFloat();
-        if (manualPres >= 500.0f && manualPres <= 2000.0f) {
+        float manualPres = 0.0f;
+        if (parseFiniteFloat(tokens[2], manualPres) &&
+            manualPres >= 500.0f && manualPres <= 2000.0f) {
           iface.settings->depthZeroPressureMbar = manualPres;
           iface.settings->depthZeroCalibrated = 1;
           Serial.print(ANSI_GREEN);
@@ -813,9 +863,18 @@ void handleCommand(const String& rawCmd) {
       }
       return;
     } else if (action == "level") {
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: Sensor calibration requires an idle, disarmed system."));
+        return;
+      }
       if (tokenCount >= 4) {
-        float pOff = tokens[2].toFloat();
-        float rOff = tokens[3].toFloat();
+        float pOff = 0.0f;
+        float rOff = 0.0f;
+        if (!parseFiniteFloat(tokens[2], pOff) || !parseFiniteFloat(tokens[3], rOff) ||
+            fabsf(pOff) > 90.0f || fabsf(rOff) > 90.0f) {
+          Serial.println(F("ERROR: IMU offsets must be finite angles between -90 and 90 degrees."));
+          return;
+        }
         iface.settings->pitchOffset = pOff;
         iface.settings->rollOffset = rOff;
         Serial.print(ANSI_GREEN);
@@ -853,33 +912,51 @@ void handleCommand(const String& rawCmd) {
     String sub = tokens[1];
     sub.toLowerCase();
     if (sub == "on" || sub == "1" || sub == "enable") {
-      if (iface.setPidState) iface.setPidState(true);
+      if (!iface.setPidState || !iface.setPidState(true)) {
+        Serial.println(F("ERROR: PID requires idle outputs, fresh IMU/depth readings, and calibrated depth."));
+        return;
+      }
       Serial.print(ANSI_GREEN);
       Serial.println(F("[PID] Active closed-loop stabilization ENABLED and ARMED."));
-      Serial.println(F("      Tilt or disturbance will now drive thrusters to restore level/depth trim."));
+      Serial.println(F("      Depth and roll control enabled; pitch stabilization is unsupported."));
       Serial.print(ANSI_RESET);
       return;
     } else if (sub == "off" || sub == "0" || sub == "disable") {
-      if (iface.setPidState) iface.setPidState(false);
+      if (!iface.setPidState || !iface.setPidState(false)) {
+        Serial.println(F("ERROR: PID could not be disabled."));
+        return;
+      }
       Serial.print(ANSI_YELLOW);
       Serial.println(F("[PID] Active closed-loop stabilization DISABLED and DISARMED. Thrusters neutral."));
       Serial.print(ANSI_RESET);
       return;
     } else if (sub == "depth" || sub == "roll" || sub == "pitch") {
+      if (!systemIdleDisarmed()) {
+        Serial.println(F("ERROR: PID gain changes require an idle, disarmed system."));
+        return;
+      }
+      if (sub == "pitch") {
+        Serial.println(F("ERROR: Pitch stabilization is unsupported; verified thruster geometry provides no pitch authority."));
+        return;
+      }
       if (tokenCount < 5) {
         Serial.printf("ERROR: Usage: pid %s <kp> <ki> <kd>\r\n", sub.c_str());
         return;
       }
-      float kp = tokens[2].toFloat();
-      float ki = tokens[3].toFloat();
-      float kd = tokens[4].toFloat();
+      float kp = 0.0f;
+      float ki = 0.0f;
+      float kd = 0.0f;
+      if (!parseFiniteFloat(tokens[2], kp) || !parseFiniteFloat(tokens[3], ki) ||
+          !parseFiniteFloat(tokens[4], kd) || kp < 0.0f || kp > 100.0f ||
+          ki < 0.0f || ki > 100.0f || kd < 0.0f || kd > 100.0f) {
+        Serial.println(F("ERROR: PID gains must be finite values between 0 and 100."));
+        return;
+      }
 
       if (sub == "depth") {
         iface.settings->pidDepth = {kp, ki, kd};
       } else if (sub == "roll") {
         iface.settings->pidRoll = {kp, ki, kd};
-      } else {
-        iface.settings->pidPitch = {kp, ki, kd};
       }
 
       Serial.print(ANSI_GREEN);
@@ -898,6 +975,10 @@ void handleCommand(const String& rawCmd) {
 
   // 10. SAVE
   if (root == "save") {
+    if (!systemIdleDisarmed()) {
+      Serial.println(F("ERROR: EEPROM writes require an idle, disarmed system."));
+      return;
+    }
     if (iface.saveSettings && iface.saveSettings()) {
       Serial.print(ANSI_BOLD_GREEN);
       Serial.printf("[EEPROM] Configuration and calibrations successfully committed! Checksum: 0x%08lX\r\n",
@@ -913,6 +994,10 @@ void handleCommand(const String& rawCmd) {
 
   // 11. DEFAULT
   if (root == "default") {
+    if (!systemIdleDisarmed()) {
+      Serial.println(F("ERROR: Resetting settings requires an idle, disarmed system."));
+      return;
+    }
     if (iface.resetDefaults) iface.resetDefaults();
     Serial.print(ANSI_YELLOW);
     Serial.println(F("[CFG] Factory default settings restored in RAM. Type 'save' to persist to EEPROM."));
@@ -931,6 +1016,36 @@ void handleCommand(const String& rawCmd) {
   }
 
   // 13. AUTORUN
+  if (root == "hil") {
+    if (tokenCount < 2) {
+      Serial.println(F("ERROR: Usage: hil <on|off|status>"));
+      return;
+    }
+
+    String sub = tokens[1];
+    sub.toLowerCase();
+    if (sub == "status") {
+      Serial.printf("HIL actuator mode: %s\r\n",
+                    iface.isHilActive && iface.isHilActive() ? "ARMED" : "DISARMED");
+    } else if (sub == "on" || sub == "arm") {
+      if (iface.setHilMode && iface.setHilMode(true)) {
+        Serial.println(F("OK: HIL actuator mode armed at a hard 15% output limit; heartbeat required."));
+      } else {
+        Serial.println(F("ERROR: HIL requires outputs ready, idle/disarmed state, autorun off, and 1500us neutral."));
+      }
+    } else if (sub == "off" || sub == "disarm") {
+      if (iface.setHilMode && iface.setHilMode(false)) {
+        Serial.println(F("OK: HIL actuator mode disarmed; thrusters neutralized if HIL was active."));
+      } else {
+        Serial.println(F("ERROR: HIL disarm failed."));
+      }
+    } else {
+      Serial.println(F("ERROR: Usage: hil <on|off|status>"));
+    }
+    return;
+  }
+
+  // 14. AUTORUN
   if (root == "autorun") {
     if (tokenCount < 2 || tokens[1].equalsIgnoreCase("status")) {
       Serial.println();
@@ -953,6 +1068,10 @@ void handleCommand(const String& rawCmd) {
       Serial.printf("Countdown Delay  : %u seconds (range: 3-60s)\r\n", iface.settings->autoRunDelaySec);
       Serial.printf("Surface Tare     : Automatic at T-%us (MS5803 depth zero calibration)\r\n", iface.settings->autoRunTareSec);
       Serial.printf("IMU Leveling     : Automatic at T-%us (MPU-6050 Pitch/Roll zero calibration)\r\n", iface.settings->autoRunLevelSec);
+      Serial.printf("Boot Depth Tare  : %s (configure in Android Parameters)\r\n",
+                    iface.settings->autoDepthTareOnBoot ? "ENABLED" : "DISABLED");
+      Serial.printf("Boot IMU Level   : %s (configure in Android Parameters)\r\n",
+                    iface.settings->autoImuLevelOnBoot ? "ENABLED" : "DISABLED");
       Serial.printf("Trajectory File  : /jalur.json (%u steps loaded, %.1f s duration)\r\n",
                     static_cast<unsigned>(Mission::getStepCount()),
                     Mission::getTotalDurationSec());
@@ -963,6 +1082,10 @@ void handleCommand(const String& rawCmd) {
 
     String sub = tokens[1];
     sub.toLowerCase();
+    if (!systemIdleDisarmed()) {
+      Serial.println(F("ERROR: Auto-run configuration requires an idle, disarmed system."));
+      return;
+    }
     if (sub == "on" || sub == "1" || sub == "enable") {
       iface.settings->autoRunEnabled = 1;
       Serial.print(ANSI_GREEN);
@@ -1053,6 +1176,10 @@ void handleCommand(const String& rawCmd) {
       String sub = tokens[1];
       sub.toLowerCase();
       if (sub == "default" || sub == "reset") {
+        if (!systemIdleDisarmed()) {
+          Serial.println(F("ERROR: Replacing the mission requires an idle, disarmed system."));
+          return;
+        }
         if (Mission::saveDefaultFile()) {
           Serial.print(ANSI_GREEN);
           Serial.println(F("OK: Default trajectory restored and saved to /jalur.json!"));
@@ -1065,6 +1192,11 @@ void handleCommand(const String& rawCmd) {
         }
         return;
       } else if (sub == "upload") {
+        if ((iface.armed && *iface.armed) ||
+            (iface.getFsmState && iface.getFsmState() != 0)) {
+          Serial.println(F("ERROR: Mission upload requires an idle, disarmed system."));
+          return;
+        }
         jsonUploadMode = true;
         jsonUploadBuffer = "";
         jsonUploadStartedAt = millis();
@@ -1091,7 +1223,11 @@ void handleCommand(const String& rawCmd) {
       Serial.println();
       return;
     }
-    float target = tokens[valIdx].toFloat();
+    float target = 0.0f;
+    if (!parseFiniteFloat(tokens[valIdx], target) || target < 0.0f || target > 140.0f) {
+      Serial.println(F("ERROR: Target depth must be a finite value between 0 and 140 cm."));
+      return;
+    }
     if (iface.setTargetDepth) {
       iface.setTargetDepth(target);
       Serial.printf("[DEPTH] Target depth set to %.1f cm.\r\n", target);
@@ -1114,18 +1250,41 @@ void handleInjPacket(const String& packet) {
   }
   p += 5;
 
-  char* endp = nullptr;
-  float depth = strtof(p, &endp);
-  if (endp && *endp == ',') p = endp + 1;
-  float pitch = strtof(p, &endp);
-  if (endp && *endp == ',') p = endp + 1;
-  float roll = strtof(p, &endp);
-  if (endp && *endp == ',') p = endp + 1;
-  float gx = strtof(p, &endp);
-  if (endp && *endp == ',') p = endp + 1;
-  float gy = strtof(p, &endp);
-  if (endp && *endp == ',') p = endp + 1;
-  float gz = strtof(p, &endp);
+  float values[6]{};
+  for (size_t i = 0; i < 6; ++i) {
+    char* endp = nullptr;
+    values[i] = strtof(p, &endp);
+    if (endp == p || !isfinite(values[i])) {
+      CLI::logWarn("Rejected malformed sensor injection packet.");
+      return;
+    }
+    p = endp;
+    if (i < 5) {
+      if (*p != ',') {
+        CLI::logWarn("Rejected malformed sensor injection packet.");
+        return;
+      }
+      ++p;
+    } else {
+      while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+      if (*p != '\0') {
+        CLI::logWarn("Rejected malformed sensor injection packet.");
+        return;
+      }
+    }
+  }
+  const float depth = values[0];
+  const float pitch = values[1];
+  const float roll = values[2];
+  const float gx = values[3];
+  const float gy = values[4];
+  const float gz = values[5];
+  if (depth < 0.0f || depth > 140.0f || fabsf(pitch) > 90.0f ||
+      fabsf(roll) > 90.0f || fabsf(gx) > 2000.0f ||
+      fabsf(gy) > 2000.0f || fabsf(gz) > 2000.0f) {
+    CLI::logWarn("Rejected out-of-range sensor injection packet.");
+    return;
+  }
 
   Sensors::SensorData data{};
   data.depthCm = depth;
@@ -1173,6 +1332,38 @@ void handleMachinePacket(const char* packet) {
     return;
   }
 
+  if (strncmp(packet, "$HIL,", 5) == 0) {
+    const char* p = packet + 5;
+    uint16_t pulses[6]{};
+    for (size_t i = 0; i < 6; ++i) {
+      char* endp = nullptr;
+      long value = strtol(p, &endp, 10);
+      if (endp == p || value < 1000 || value > 2000 ||
+          (i < 5 && *endp != ',') ||
+          (i == 5 && *endp != '\0')) {
+        Serial.println(F("$HIL,ERR,INVALID_PACKET"));
+        return;
+      }
+      pulses[i] = static_cast<uint16_t>(value);
+      p = (i < 5) ? endp + 1 : endp;
+    }
+
+    if (!iface.setHilPulses || !iface.setHilPulses(pulses)) {
+      Serial.println(F("$HIL,ERR,NOT_ARMED_OR_LIMIT"));
+      return;
+    }
+    char actBuf[64];
+    snprintf(actBuf, sizeof(actBuf), "$ACT,%u,%u,%u,%u,%u,%u\r\n",
+             iface.getCurrentPulse ? iface.getCurrentPulse(0) : 1500,
+             iface.getCurrentPulse ? iface.getCurrentPulse(1) : 1500,
+             iface.getCurrentPulse ? iface.getCurrentPulse(2) : 1500,
+             iface.getCurrentPulse ? iface.getCurrentPulse(3) : 1500,
+             iface.getCurrentPulse ? iface.getCurrentPulse(4) : 1500,
+             iface.getCurrentPulse ? iface.getCurrentPulse(5) : 1500);
+    Serial.print(actBuf);
+    return;
+  }
+
   if (strcmp(packet, "$POLL") == 0 || strcmp(packet, "$GET") == 0) {
     sendTelemPacket();
     return;
@@ -1203,6 +1394,10 @@ void handleMachinePacket(const char* packet) {
 
 }  // namespace
 
+void handleCommand(const String& rawCmd) {
+  handleCommandImpl(rawCmd);
+}
+
 void sendTelemPacket() {
   Sensors::SensorData s{};
   Sensors::snapshot(s);
@@ -1216,9 +1411,9 @@ void sendTelemPacket() {
   int isArmed = (iface.armed && *iface.armed) ? 1 : 0;
   int fsmStateNum = iface.getFsmState ? static_cast<int>(iface.getFsmState()) : 0;
 
-  char buf[160];
+  char buf[192];
   snprintf(buf, sizeof(buf),
-           "$TEL,%s,%s,%s,%s,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%d,%d\r\n",
+           "$TEL,%s,%s,%s,%s,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u\r\n",
            fmtFloat(s.depthCm, 1).c_str(),
            fmtFloat(s.pressureMbar, 1).c_str(),
            fmtFloat(s.pitch, 1).c_str(),
@@ -1228,7 +1423,10 @@ void sendTelemPacket() {
            fmtFloat(s.gyroDps[1], 1).c_str(),
            fmtFloat(s.gyroDps[2], 1).c_str(),
            t1, t2, t3, t4, t5, t6,
-           isArmed, fsmStateNum);
+           isArmed, fsmStateNum,
+           s.imuReady ? 1U : 0U,
+           s.pressureReady ? 1U : 0U,
+           s.i2cReady ? 1U : 0U);
   Serial.print(buf);
 }
 
@@ -1288,6 +1486,13 @@ void update() {
 
     while (Serial.available()) {
       char c = static_cast<char>(Serial.read());
+      if (jsonUploadBuffer.length() >= 3513) {
+        jsonUploadMode = false;
+        jsonUploadBuffer = "";
+        Serial.println(F("\r\n[UPLOAD] ERROR: Mission payload exceeds the 3500-byte limit."));
+        printPrompt();
+        return;
+      }
       jsonUploadBuffer += c;
 
       if (jsonUploadBuffer.endsWith("===EOF===\r\n") || jsonUploadBuffer.endsWith("===EOF===\n") ||
@@ -1301,7 +1506,9 @@ void update() {
 
         jsonUploadMode = false;
         String err;
-        if (Mission::saveJsonString(jsonUploadBuffer, err)) {
+        if (jsonUploadBuffer.length() > 3500) {
+          Serial.println(F("\r\n[UPLOAD] ERROR: Mission payload exceeds the 3500-byte limit."));
+        } else if (Mission::saveJsonString(jsonUploadBuffer, err)) {
           Serial.println(F("\r\n[UPLOAD] SUCCESS: Mission trajectory updated in /jalur.json!"));
           Mission::printMissionTable();
         } else {
@@ -1323,6 +1530,7 @@ void update() {
     if (c == '$') {
       inMachinePacket = true;
       machineLen = 0;
+      machinePacketOverflow = false;
       machineBuffer[machineLen++] = c;
       machineBuffer[machineLen] = '\0';
       continue;
@@ -1332,17 +1540,20 @@ void update() {
     if (inMachinePacket) {
       if (c == '\r' || c == '\n') {
         inMachinePacket = false;
-        if (machineLen > 0) {
+        if (machineLen > 0 && !machinePacketOverflow) {
           machineBuffer[machineLen] = '\0';
           handleMachinePacket(machineBuffer);
-          machineLen = 0;
-          machineBuffer[0] = '\0';
-          machinePacketJustFinished = true;
         }
+        machineLen = 0;
+        machineBuffer[0] = '\0';
+        machinePacketOverflow = false;
+        machinePacketJustFinished = true;
       } else {
         if (machineLen < sizeof(machineBuffer) - 1) {
           machineBuffer[machineLen++] = c;
           machineBuffer[machineLen] = '\0';
+        } else {
+          machinePacketOverflow = true;
         }
       }
       continue;
@@ -1396,14 +1607,14 @@ void update() {
             if (iface.cancelMission) iface.cancelMission();
             Serial.println(F("[AUTORUN] Countdown ABORTED by operator. System returned to IDLE mode."));
             if (testCmd != "stop" && testCmd != "abort" && testCmd != "disarm") {
-              handleCommand(cmd);
+              handleCommandImpl(cmd);
             }
             printPrompt();
             return;
           }
         }
 
-        handleCommand(cmd);
+        handleCommandImpl(cmd);
         printPrompt();
       } else {
         // Empty enter pressed

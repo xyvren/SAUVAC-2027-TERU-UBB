@@ -1,15 +1,15 @@
 /**
- * AUVHydrodynamics2D - Standalone & Digital Twin 2D Hydrodynamic Physics Engine
- * Formulasi Standar Dinamika Wahana Bawah Air Thor I. Fossen (2011/2021) & SNAME (1950)
+ * AUVHydrodynamics2D - Experimental reduced 4-DOF digital-twin model
+ * Inspired by standard marine-vehicle dynamics; not a validated full Fossen model.
  * Khusus AUV SAUVAC 2027 Universitas Bangka Belitung (UBB)
  *
  * Fitur Utama:
- * 1. Persamaan Gerak Planar 3-DOF Terkopel:
+ * 1. Persamaan Gerak Planar 4-DOF (surge, heave, pitch, roll):
  *    M * dnu/dt + C(nu)*nu + D(nu_r)*nu_r + g(eta) = tau_thruster + tau_dist
  * 2. Matriks Massa Total M = M_RB + M_A & Inversi Analitik Dinamis Waktu Nyata
  * 3. Parameter Bobot (Massa Kering, Net Buoyancy, Drag Scale) yang Dapat Disesuaikan Secara Interaktif
  * 4. Model Gangguan Lingkungan Kolam SAUVC Berdasarkan Teori Gelombang Linier Airy (Peluruhan e^-kz)
- * 5. Agen Kontroler RL-PID Adaptif Berbasis Heuristik Bounded Actor-Critic (Deadband, Windup Clamping & Damping Boost)
+ * 5. Heuristic PID tuning (not reinforcement learning or hardware control evidence)
  * 6. Integrasi Numerik 60 FPS Semi-Implicit Euler (Symplectic) dengan Jaminan Pasivitas Energi
  */
 
@@ -36,14 +36,16 @@ class AUVHydrodynamics2D {
     // -------------------------------------------------------------
     // 2. Parameter Fisika Robot yang Dapat Dikonfigurasi Pengguna
     // -------------------------------------------------------------
-    // Massa kering robot (kg): Rentang 8.0 s.d. 25.0 kg, default 14.5 kg
+    // Massa kering robot (kg): Rentang 5.0 s.d. 50.0 kg, default 14.5 kg
     this.m = options.m !== undefined ? Number(options.m) : 14.5;
 
-    // Balas daya apung bersih positif (gram): Rentang +50g s.d. +500g, default +150g
+    // Balas daya apung bersih (gram): negatif tenggelam, positif naik
     this.netBuoyancyGrams = options.netBuoyancyGrams !== undefined ? Number(options.netBuoyancyGrams) : 150.0;
 
-    // Skala faktor seretan air (drag multiplier): Rentang 0.5x s.d. 2.0x, default 1.0x
+    // Skala faktor seretan air (drag multiplier): Rentang 0.2x s.d. 5.0x, default 1.0x
     this.dragScale = options.dragScale !== undefined ? Number(options.dragScale) : 1.0;
+    this.thrusterReverse = [1, 1, 0, 0, 0, 1];
+    if (options.thrusterReverse !== undefined) this.setThrusterReverse(options.thrusterReverse);
 
     // -------------------------------------------------------------
     // 3. Koefisien Massa Tambah Hidrodinamika (Added Mass, kg & kg*m^2)
@@ -52,6 +54,7 @@ class AUVHydrodynamics2D {
     this.Z_w_dot = -8.20; // Heave added mass (pelat akrilik & baterai)
     this.Y_v_dot = -7.00; // Sway added mass (sisi lateral lambung)
     this.M_q_dot = -0.18; // Pitch added inertia (momen air angular)
+    this.K_p_dot = -0.10; // Roll added inertia (momen air angular)
     this.N_r_dot = -0.22; // Yaw added inertia (momen air putar)
 
     // -------------------------------------------------------------
@@ -61,15 +64,18 @@ class AUVHydrodynamics2D {
     this.baseZw = 12.00;  this.baseZww = 98.18;  // Heave damping
     this.baseYv = 7.00;   this.baseYvv = 65.00;  // Sway damping
     this.baseMq = 1.50;   this.baseMqq = 2.04;   // Pitch damping
+    this.baseKp = 1.50;   this.baseKpp = 2.04;   // Roll damping
     this.baseNr = 1.80;   this.baseNrr = 2.50;   // Yaw damping
 
     // -------------------------------------------------------------
     // 5. Matriks Inersia Benda Kaku, Massa Total & Balikan M^-1
     // -------------------------------------------------------------
     this.Iy = 0.48962; // Inersia pitch terhadap CB
+    this.Ix = 0.27000; // Inersia roll terhadap CB
     this.Iz = 0.57867; // Inersia yaw terhadap CB
     this.netBuoyancy = 1.471; // Gaya apung bersih ke atas (N)
     this.restoringPitchStiffness = 6.3988; // K_theta = m * g * zG (N*m/rad)
+    this.restoringRollStiffness = 6.3988;
     this.pitchNaturalFreq = 3.091; // rad/s
     this.pitchNaturalPeriod = 2.033; // detik
 
@@ -95,6 +101,8 @@ class AUVHydrodynamics2D {
     // eta[1] = z (m, kedalaman 0-1.40m)
     // eta[2] = theta (rad, sudut pitch, positif hidung naik)
     this.eta = [1.0, 0.0, 0.0];
+    this.phi = 0.0;          // Roll angle (rad)
+    this.p = 0.0;            // Roll rate (rad/s)
 
     // Kecepatan dalam Body-Fixed Frame:
     // nu[0] = u (m/s, kecepatan maju surge)
@@ -118,8 +126,10 @@ class AUVHydrodynamics2D {
 
     // Gaya terfilter aktual yang bekerja pada wahana:
     this.actualThrustX = 0.0; // Gaya dorong surge (N)
+    this.actualThrustY = 0.0; // Gaya dorong sway (N)
     this.actualThrustZ = 0.0; // Gaya dorong heave (N)
     this.actualThrustQ = 0.0; // Momen dorong pitch (N*m)
+    this.actualThrustRoll = 0.0; // Momen dorong roll (N*m)
     this.actualThrustYaw = 0.0; // Momen dorong yaw (N*m)
 
     // -------------------------------------------------------------
@@ -136,21 +146,16 @@ class AUVHydrodynamics2D {
     this.transientHeaveSpike = 0.0; // Impuls heave sesaat (m/s)
 
     // -------------------------------------------------------------
-    // 9. Loop Kontroler Closed-Loop RL-PID Terintegrasi
+    // 9. Heuristic adaptive PID controller for the reduced simulator
     // -------------------------------------------------------------
-    this.rlEnabled = true;
+    this.rlEnabled = false;
     this.pid = {
-      targetZ: 0.50,            // Target kedalaman (m)
-      targetTheta: 0.0,         // Target pitch horizontal (rad)
+      targetZ: 0.0,             // Target kedalaman (m); standby at the surface
       baseKp_z: 38.0,           // Base proportional gain (N/m)
       baseKi_z: 6.0,            // Base integral gain (N/(m*s))
       baseKd_z: 26.0,           // Base derivative damping (N*s/m)
-      baseKp_th: 8.5,           // Pitch Kp (N*m/rad)
-      baseKi_th: 0.8,           // Pitch Ki
-      baseKd_th: 4.8,           // Pitch Kd
       integralZ: 0.0,           // Akumulator integral kedalaman
-      integralTheta: 0.0,       // Akumulator integral pitch
-      activeKp_z: 38.0,         // Gain aktif modulasi RL
+      activeKp_z: 38.0,         // Gain aktif dengan scheduling heuristik
       activeKi_z: 6.0,
       activeKd_z: 26.0,
       mode: 'SETPOINT_LOCK',    // Status heuristik aktif
@@ -165,40 +170,67 @@ class AUVHydrodynamics2D {
   // METODE REKONFIGURASI PARAMETER BOBOT & MASSA WAKTU NYATA
   // ===============================================================
 
+  setThrusterReverse(directions) {
+    if (!Array.isArray(directions) || directions.length !== 6) {
+      throw new TypeError('thrusterReverse must contain six directions');
+    }
+
+    const normalized = directions.map(direction => {
+      if (direction === true || direction === 1) return 1;
+      if (direction === false || direction === 0) return 0;
+      return null;
+    });
+    if (normalized.some(direction => direction === null)) {
+      throw new TypeError('thrusterReverse directions must be boolean or 0/1');
+    }
+
+    this.thrusterReverse = normalized;
+    return this.thrusterReverse.slice();
+  }
+
+  setDeadbandUs(deadbandUs) {
+    const value = Number(deadbandUs);
+    if (!Number.isFinite(value) || value < 0 || value >= 500) {
+      throw new RangeError('deadbandUs must be between 0 and 499');
+    }
+    this.deadbandUs = value;
+    return this.deadbandUs;
+  }
+
   /**
    * Mengatur massa kering robot dan memperbarui seluruh matriks inersia.
-   * @param {number} massKg Massa baru dalam kilogram (8.0 s.d. 25.0 kg)
+   * @param {number} massKg Massa baru dalam kilogram (5.0 s.d. 50.0 kg)
    */
   setMass(massKg) {
     const val = Number(massKg);
     if (!isNaN(val) && val > 0) {
-      this.m = Math.max(5.0, Math.min(40.0, val));
+      this.m = Math.max(5.0, Math.min(50.0, val));
       this.recalculateMassAndBuoyancy();
     }
     return this.getPhysicsSummary();
   }
 
   /**
-   * Mengatur balas daya apung bersih (+50g s.d. +500g).
-   * @param {number} grams Gram apung bersih ke atas
+   * Mengatur daya apung bersih (-1000g s.d. +1000g).
+   * @param {number} grams Gram apung bersih; positif mengarah ke atas
    */
   setNetBuoyancy(grams) {
     const val = Number(grams);
     if (!isNaN(val)) {
-      this.netBuoyancyGrams = Math.max(0.0, Math.min(1000.0, val));
+      this.netBuoyancyGrams = Math.max(-1000.0, Math.min(1000.0, val));
       this.recalculateMassAndBuoyancy();
     }
     return this.getPhysicsSummary();
   }
 
   /**
-   * Mengatur faktor pengali hambatan seretan air (0.5x s.d. 2.0x).
+   * Mengatur faktor pengali hambatan seretan air (0.2x s.d. 5.0x).
    * @param {number} scale Multiplier drag kuadratik & linier
    */
   setDragScale(scale) {
     const val = Number(scale);
     if (!isNaN(val) && val > 0) {
-      this.dragScale = Math.max(0.2, Math.min(4.0, val));
+      this.dragScale = Math.max(0.2, Math.min(5.0, val));
       this.recalculateMassAndBuoyancy();
     }
     return this.getPhysicsSummary();
@@ -212,16 +244,19 @@ class AUVHydrodynamics2D {
     // 1. Momen inersia benda kaku terhadap CB (teorema sumbu sejajar)
     const Iyy_CG = (1.0 / 12.0) * this.m * (this.L * this.L + this.H * this.H);
     this.Iy = Iyy_CG + this.m * (this.zG * this.zG);
+    const Ixx_CG = (1.0 / 12.0) * this.m * (this.B * this.B + this.H * this.H);
+    this.Ix = Ixx_CG + this.m * (this.zG * this.zG);
 
     const Izz_CG = (1.0 / 12.0) * this.m * (this.L * this.L + this.B * this.B);
     this.Iz = Izz_CG; // xG = yG = 0
 
-    // 2. Gaya apung bersih ke atas (Net Positive Buoyancy, N)
+    // 2. Gaya apung bersih bertanda: positif ke atas, negatif ke bawah (N)
     // F_buoy = delta_m * g
     this.netBuoyancy = (this.netBuoyancyGrams / 1000.0) * this.g;
 
     // 3. Kekakuan metasentrik pemulih pitch K_theta = m * g * zG (N*m/rad)
     this.restoringPitchStiffness = this.m * this.g * this.zG;
+    this.restoringRollStiffness = this.restoringPitchStiffness;
 
     // 4. Frekuensi dan periode alami osilasi pitch
     const totalIy = this.Iy - this.M_q_dot;
@@ -260,10 +295,14 @@ class AUVHydrodynamics2D {
     // 7. Redaman terskala
     this.Xu = this.baseXu * this.dragScale;
     this.Xuu = this.baseXuu * this.dragScale;
+    this.Yv = this.baseYv * this.dragScale;
+    this.Yvv = this.baseYvv * this.dragScale;
     this.Zw = this.baseZw * this.dragScale;
     this.Zww = this.baseZww * this.dragScale;
     this.Mq = this.baseMq * this.dragScale;
     this.Mqq = this.baseMqq * this.dragScale;
+    this.Kp = this.baseKp * this.dragScale;
+    this.Kpp = this.baseKpp * this.dragScale;
   }
 
   /**
@@ -277,6 +316,7 @@ class AUVHydrodynamics2D {
       totalMassSurge: Number((this.m - this.X_u_dot).toFixed(2)),
       totalMassHeave: Number((this.m - this.Z_w_dot).toFixed(2)),
       totalPitchInertia: Number((this.Iy - this.M_q_dot).toFixed(4)),
+      totalRollInertia: Number((this.Ix - this.K_p_dot).toFixed(4)),
       buoyancyForceN: Number(this.netBuoyancy.toFixed(3)),
       pitchStiffness: Number(this.restoringPitchStiffness.toFixed(3)),
       naturalPeriodSec: Number(this.pitchNaturalPeriod.toFixed(2)),
@@ -364,30 +404,102 @@ class AUVHydrodynamics2D {
     }
   }
 
+  thrustToPwm(thrustN, reverse = 0) {
+    const reverseLimit = this.maxThrustPerMotor / this.camberFactor;
+    const value = Number(thrustN);
+    if (!Number.isFinite(value)) return 1500;
+
+    const thrust = Math.max(-reverseLimit, Math.min(this.maxThrustPerMotor, value));
+    if (Math.abs(thrust) < 1e-6) return 1500;
+
+    const limit = thrust > 0 ? this.maxThrustPerMotor : reverseLimit;
+    const fraction = Math.pow(Math.abs(thrust) / limit, 1.0 / 1.8);
+    const delta = this.deadbandUs + fraction * (500.0 - this.deadbandUs);
+    const effectiveDelta = thrust > 0 ? delta : -delta;
+    return Math.max(1000, Math.min(2000, Math.round(
+      reverse === 1 ? 1500 - effectiveDelta : 1500 + effectiveDelta
+    )));
+  }
+
+  horizontalCommandPulses(action, pulseDeltaUs) {
+    const value = Number(pulseDeltaUs);
+    if (!Number.isFinite(value)) {
+      throw new TypeError('pulseDeltaUs must be finite');
+    }
+
+    const magnitude = Math.min(500, Math.abs(value));
+    const direction = String(action || '').trim().toUpperCase();
+    let efforts;
+
+    switch (direction) {
+      case 'FORWARD':
+      case 'MAJU':
+        efforts = [1, 1, 1, 1];
+        break;
+      case 'BACKWARD':
+      case 'MUNDUR':
+      case 'REVERSE':
+        efforts = [-1, -1, -1, -1];
+        break;
+      case 'TURN':
+      case 'PUTAR':
+      case 'YAW':
+      case 'TURN_RIGHT':
+        efforts = [1, -1, 1, -1];
+        break;
+      case 'TURN_LEFT':
+        efforts = [-1, 1, -1, 1];
+        break;
+      case 'SWAY_RIGHT':
+      case 'SWAYRIGHT':
+      case 'KANAN':
+        efforts = [1, -1, -1, 1];
+        break;
+      case 'SWAY_LEFT':
+      case 'SWAYLEFT':
+      case 'KIRI':
+        efforts = [-1, 1, 1, -1];
+        break;
+      default:
+        return [1500, 1500, 1500, 1500, 1500, 1500];
+    }
+
+    const pulses = [1500, 1500, 1500, 1500, 1500, 1500];
+    efforts.forEach((effort, index) => {
+      const effectiveDelta = effort * magnitude;
+      const rawDelta = this.thrusterReverse[index] === 1
+        ? -effectiveDelta
+        : effectiveDelta;
+      pulses[index] = Math.max(1000, Math.min(2000, Math.round(1500 + rawDelta)));
+    });
+    return pulses;
+  }
+
   /**
    * Mengalokasikan 6 sinyal pulsa thruster [T1..T6] ke dalam vektor gaya bodi:
-   * T1..T4: 4 Pendorong horizontal 45 derajat (Surge & Yaw)
-   * T5, T6: 2 Pendorong vertikal heave (Heave & Roll/Pitch)
-   * Polaritas Hardware SAUVAC: T1:rev=1, T2:rev=1, T3:rev=0, T4:rev=0, T5:rev=0, T6:rev=1
+   * T1..T4: 4 pendorong horizontal 45 derajat (Surge, Sway & Yaw)
+   * T5, T6: 2 vertical thrusters for heave and differential roll
+   * Polaritas default; konfigurasi aktual disediakan lewat setThrusterReverse().
    * @param {Array<number>} pulses Array 6 pulsa PWM [T1, T2, T3, T4, T5, T6]
-   * @returns {{tauX: number, tauZ: number, tauQ: number, tauYaw: number}}
+   * @returns {{tauX: number, tauY: number, tauZ: number, tauQ: number, tauRoll: number, tauYaw: number}}
    */
   thrustAllocation(pulses) {
     if (!Array.isArray(pulses) || pulses.length < 6) {
-      return { tauX: 0.0, tauZ: 0.0, tauQ: 0.0, tauYaw: 0.0 };
+      return { tauX: 0.0, tauY: 0.0, tauZ: 0.0, tauQ: 0.0, tauRoll: 0.0, tauYaw: 0.0 };
     }
 
-    const reverse = [1, 1, 0, 0, 1, 0];
-    const t = pulses.map((p, idx) => this.pwmToThrust(p, reverse[idx]));
+    const t = pulses.map((p, idx) => this.pwmToThrust(p, this.thrusterReverse[idx]));
 
     // Surge (maju): proyeksi sudut 45 derajat (sqrt(2)/2) dari 4 motor horizontal
     // T1(RL), T2(FR), T3(FL), T4(RR)
     const cos45 = 0.70710678;
     const tauX = (t[0] + t[1] + t[2] + t[3]) * cos45;
+    const tauY = (t[0] - t[1] - t[2] + t[3]) * cos45;
 
     // Heave (selam): T5 (mid-right) dan T6 (mid-left) mengarah vertikal
     // Catatan: Dorongan positif ke bawah (+Z) menekan robot menyelam
     const tauZ = t[4] + t[5];
+    const tauRoll = (t[4] - t[5]) * 0.22;
 
     // Pitch: lengan momen diferensial kecil antara thruster depan dan belakang
     const armX = 0.18; // meter lever arm
@@ -397,23 +509,21 @@ class AUVHydrodynamics2D {
     // T1(RL, Port), T2(FR, Starboard), T3(FL, Port), T4(RR, Starboard)
     const tauYaw = (t[0] + t[2] - t[1] - t[3]) * cos45 * armX;
 
-    return { tauX, tauZ, tauQ, tauYaw };
+    return { tauX, tauY, tauZ, tauQ, tauRoll, tauYaw };
   }
 
   // ===============================================================
-  // KONTROLER CLOSED-LOOP RL-PID ADAPTIF (LAPTOP ENGINE)
+  // HEURISTIC ADAPTIVE PID CONTROLLER (REDUCED LAPTOP MODEL)
   // ===============================================================
 
   /**
-   * Mengevaluasi hukum adaptasi RL-PID untuk modulasi gain dinamis.
+   * Applies bounded heuristic gain scheduling to the reduced model.
    * @param {number} dt Langkah waktu integrasi (detik)
    * @param {number} ez Error kedalaman: targetZ - z (meter)
-   * @param {number} eth Error pitch: targetTheta - theta (radian)
-   * @returns {{tauZ: number, tauQ: number}} Gaya kontrol dalam Newton & N*m
+   * @returns {{tauZ: number}} Gaya kontrol kedalaman dalam Newton
    */
-  updateRLPID(dt, ez, eth) {
+  updateRLPID(dt, ez) {
     const w = this.nu[1]; // Kecepatan vertikal heave
-    const q = this.nu[2]; // Kecepatan angular pitch
 
     if (!this.rlEnabled) {
       // Mode Manual Baseline (tanpa adaptasi dinamis)
@@ -424,17 +534,14 @@ class AUVHydrodynamics2D {
       this.pid.modeGlow = '#64748b';
 
       const tauZ = this.pid.baseKp_z * ez - this.pid.baseKd_z * w + this.netBuoyancy;
-      const tauQ = this.pid.baseKp_th * eth - this.pid.baseKd_th * q;
-      return { tauZ, tauQ };
+      return { tauZ };
     }
 
     // 1. Integrator dengan pencegahan Windup (Clamping & Deadband Guard)
     if (Math.abs(ez) < 0.18) {
       this.pid.integralZ = Math.max(-0.50, Math.min(0.50, this.pid.integralZ + ez * dt));
     }
-    this.pid.integralTheta = Math.max(-0.25, Math.min(0.25, this.pid.integralTheta + eth * dt));
-
-    // 2. Modulasi Adaptif Gain Proporsional (Kp Boost saat gangguan besar)
+    // 2. Heuristic proportional gain scheduling
     const deadbandZ = 0.020; // 2 cm deadband koridor
     let currentMode = 'SETPOINT_LOCK';
     let currentGlow = '#06b6d4'; // Cyan default
@@ -450,7 +557,7 @@ class AUVHydrodynamics2D {
     }
 
     // 3. Kinetic Damping Boost (Kd Boost saat turbulensi atau osilasi cepat)
-    if (Math.abs(w) > 0.05 || Math.abs(q) > 0.08) {
+    if (Math.abs(w) > 0.05) {
       const dampRatio = Math.min(1.5, Math.abs(w) / 0.10);
       this.pid.activeKd_z = this.pid.baseKd_z * (1.0 + 0.35 * dampRatio);
       currentMode = 'DAMPING_KINETIK_KD';
@@ -469,12 +576,7 @@ class AUVHydrodynamics2D {
                  this.pid.activeKd_z * w +
                  this.netBuoyancy;
 
-    // Kontrol Pitch Leveling
-    const tauQ = this.pid.baseKp_th * eth +
-                 this.pid.baseKi_th * this.pid.integralTheta -
-                 this.pid.baseKd_th * q;
-
-    return { tauZ, tauQ };
+    return { tauZ };
   }
 
   // ===============================================================
@@ -500,6 +602,8 @@ class AUVHydrodynamics2D {
     const u = this.nu[0];
     const w = this.nu[1];
     const q = this.nu[2];
+    const phi = this.phi;
+    const p = this.p;
 
     const cosTh = Math.cos(theta);
     const sinTh = Math.sin(theta);
@@ -513,51 +617,78 @@ class AUVHydrodynamics2D {
 
     // 2. Tentukan Gaya Perintah Pendorong (Commanded Thrusts)
     let cmdThrustX = 0.0;
+    let cmdThrustY = 0.0;
     let cmdThrustZ = 0.0;
     let cmdThrustQ = 0.0;
+    let cmdThrustRoll = Number(input.rollMoment) || 0.0;
     let cmdThrustYaw = 0.0;
+    const motorPulses = input.pulses && input.pulses.length >= 6
+      ? input.pulses.slice(0, 6)
+      : [1500, 1500, 1500, 1500, 1500, 1500];
+    let depthHoldActive = false;
+    let rollDifferentialThrust = 0.0;
 
     let hasExplicitHeave = false;
     if (input.pulses && Array.isArray(input.pulses)) {
       const alloc = this.thrustAllocation(input.pulses);
       cmdThrustX = alloc.tauX;
+      cmdThrustY = alloc.tauY;
       cmdThrustZ = alloc.tauZ;
       cmdThrustQ = alloc.tauQ;
+      cmdThrustRoll += alloc.tauRoll;
       cmdThrustYaw = alloc.tauYaw;
-      if (Math.abs(alloc.tauZ) > 0.15) {
-        hasExplicitHeave = true;
+      hasExplicitHeave = Math.abs(alloc.tauZ) > 0.15;
+      if (input.pulses.length >= 6) {
+        rollDifferentialThrust = (
+          this.pwmToThrust(input.pulses[4], 0) -
+          this.pwmToThrust(input.pulses[5], 1)
+        ) / 2.0;
       }
     } else {
       if (input.surgeThrust !== undefined) cmdThrustX = input.surgeThrust;
+      if (input.swayThrust !== undefined) cmdThrustY = input.swayThrust;
       if (input.heaveThrust !== undefined) {
         cmdThrustZ = input.heaveThrust;
         hasExplicitHeave = true;
       }
       if (input.pitchMoment !== undefined) cmdThrustQ = input.pitchMoment;
+      if (input.rollMoment !== undefined) cmdThrustRoll = input.rollMoment;
       if (input.yawTorque !== undefined) cmdThrustYaw = input.yawTorque;
     }
 
-    // Closed-loop automatic depth hold & RL-PID stabilization:
-    // If no manual dive/surface heave thrust is actively commanded, but targetZ is set > 0.02m (or RL-PID is active):
+    // Depth control is limited to the two vertical thrusters; pitch PID is not mapped
+    // because the verified hardware mixer has no pitch-control axis.
     if (!hasExplicitHeave && (this.rlEnabled || this.pid.targetZ > 0.02)) {
       const ez = this.pid.targetZ - z;
-      const eth = this.pid.targetTheta - theta;
-      const ctrl = this.updateRLPID(dt, ez, eth);
+      const ctrl = this.updateRLPID(dt, ez);
       cmdThrustZ = ctrl.tauZ;
-      cmdThrustQ += ctrl.tauQ;
+      depthHoldActive = true;
+      motorPulses[4] = this.thrustToPwm(cmdThrustZ / 2.0 + rollDifferentialThrust, 0);
+      motorPulses[5] = this.thrustToPwm(cmdThrustZ / 2.0 - rollDifferentialThrust, 1);
+      const verticalThrust = [
+        this.pwmToThrust(motorPulses[4], 0),
+        this.pwmToThrust(motorPulses[5], 1)
+      ];
+      cmdThrustZ = verticalThrust[0] + verticalThrust[1];
+      cmdThrustRoll = (Number(input.rollMoment) || 0) +
+        (verticalThrust[0] - verticalThrust[1]) * 0.22;
     }
 
     // 3. Filter Lag Respons ESC Orde-1 (tau = 50ms)
     const escAlpha = dt / Math.max(dt, this.tauESC);
     this.actualThrustX += (cmdThrustX - this.actualThrustX) * escAlpha;
+    this.actualThrustY += (cmdThrustY - this.actualThrustY) * escAlpha;
     this.actualThrustZ += (cmdThrustZ - this.actualThrustZ) * escAlpha;
     this.actualThrustQ += (cmdThrustQ - this.actualThrustQ) * escAlpha;
+    this.actualThrustRoll += (cmdThrustRoll - this.actualThrustRoll) * escAlpha;
     this.actualThrustYaw += (cmdThrustYaw - this.actualThrustYaw) * escAlpha;
 
     // 4. Redaman Hidrodinamika Non-Linier D(nu_r)*nu_r (Linier Viskos + Kuadratik Form Drag)
     const X_d = (this.Xu + this.Xuu * Math.abs(u_rel)) * u_rel;
+    const Y_d = (this.Yv + this.Yvv * Math.abs(this.v)) * this.v;
     const Z_d = (this.Zw + this.Zww * Math.abs(w_rel)) * w_rel;
     const M_d = (this.Mq + this.Mqq * Math.abs(q_rel)) * q_rel;
+    const K_d = (this.Kp + this.Kpp * Math.abs(p)) * p;
 
     // 5. Gaya Pemulih Hidrostatis g(eta)
     // Sisi kiri persamaan Fossen:
@@ -567,6 +698,7 @@ class AUVHydrodynamics2D {
     const g_u = -this.netBuoyancy * sinTh;
     const g_w =  this.netBuoyancy * cosTh;
     const g_q =  this.restoringPitchStiffness * sinTh;
+    const g_p =  this.restoringRollStiffness * Math.sin(phi);
 
     // 6. Gaya Coriolis & Sentripetal Skew-Symmetric C(nu)*nu
     const p1 = (this.m - this.X_u_dot) * u + (this.m * this.zG) * q;
@@ -577,36 +709,45 @@ class AUVHydrodynamics2D {
 
     // 7. Akumulasi Gaya Total pada Sisi Kanan Dinamika
     const tau_u_total = this.actualThrustX - X_d - g_u - C_u;
+    const tau_v_total = this.actualThrustY - Y_d;
     const tau_w_total = this.actualThrustZ - Z_d - g_w - C_w;
     const tau_q_total = this.actualThrustQ - M_d - g_q - C_q;
 
     // 8. Percepatan Dinamika Bodi: dnu = M^-1 * tau_total
     const du = this.M_inv[0][0] * tau_u_total + this.M_inv[0][2] * tau_q_total;
+    const dv = tau_v_total / (this.m - this.Y_v_dot);
     const dw = this.M_inv[1][1] * tau_w_total;
     const dq = this.M_inv[2][0] * tau_u_total + this.M_inv[2][2] * tau_q_total;
+    const dp = (this.actualThrustRoll - K_d - g_p) / (this.Ix - this.K_p_dot);
 
     // 9. Integrasi Kecepatan Bodi (Semi-Implicit Euler Step 1)
     this.nu[0] += du * dt;
+    this.v += dv * dt;
     this.nu[1] += dw * dt;
     this.nu[2] += dq * dt;
+    this.p += dp * dt;
 
     // Batas pengaman kecepatan fisis (mencegah overflow ekstrem):
     // Kecepatan maju maksimum AUV di kolam ~1.2 m/s
     this.nu[0] = Math.max(-1.5, Math.min(1.5, this.nu[0]));
+    this.v = Math.max(-1.0, Math.min(1.0, this.v));
     this.nu[1] = Math.max(-1.0, Math.min(1.0, this.nu[1]));
     this.nu[2] = Math.max(-2.5, Math.min(2.5, this.nu[2]));
+    this.p = Math.max(-2.5, Math.min(2.5, this.p));
 
     // 10. Transformasi Kinematika ke Koordinat Kolam (Semi-Implicit Euler Step 2)
     const cosYaw = Math.cos(this.yaw);
     const sinYaw = Math.sin(this.yaw);
     const dx =  this.nu[0] * cosTh + this.nu[1] * sinTh;
+    const dy = this.v;
     const dz = -this.nu[0] * sinTh + this.nu[1] * cosTh;
     const dth = this.nu[2];
 
-    this.eta[0] += (dx * cosYaw) * dt;
-    this.y = (this.y || 0.0) + (dx * sinYaw) * dt;
+    this.eta[0] += (dx * cosYaw - dy * sinYaw) * dt;
+    this.y = (this.y || 0.0) + (dx * sinYaw + dy * cosYaw) * dt;
     this.eta[1] += dz * dt;
     this.eta[2] += dth * dt;
+    this.phi += this.p * dt;
 
     // 11. Dinamika Geleng Tambahan (Yaw & Sway)
     const dyaw = this.actualThrustYaw * (1.0 / (this.Iz - this.N_r_dot));
@@ -631,20 +772,25 @@ class AUVHydrodynamics2D {
       if (this.nu[1] > 0) this.nu[1] = 0.0;
     }
 
-    // Batas panjang lintasan kolam (0.2m s.d. 11.8 meter)
-    if (this.eta[0] < 0.20) {
-      this.eta[0] = 0.20;
+    // Keep the full hull inside the 12m pool, including the 8cm inner wall face.
+    const endClearance = 0.08 + this.L / 2.0;
+    const minX = endClearance;
+    const maxX = 12.0 - endClearance;
+    if (this.eta[0] < minX) {
+      this.eta[0] = minX;
       if (this.nu[0] < 0) this.nu[0] = 0.0;
-    } else if (this.eta[0] > 11.80) {
-      this.eta[0] = 11.80;
+    } else if (this.eta[0] > maxX) {
+      this.eta[0] = maxX;
       if (this.nu[0] > 0) this.nu[0] = 0.0;
     }
 
     // Batas lebar kolam (-2.2m s.d. +2.2 meter)
     if (this.y < -2.20) {
       this.y = -2.20;
+      if (this.v < 0) this.v = 0;
     } else if (this.y > 2.20) {
       this.y = 2.20;
+      if (this.v > 0) this.v = 0;
     }
 
     // Kembalikan status lengkap
@@ -653,10 +799,14 @@ class AUVHydrodynamics2D {
       xCm: this.eta[0] * 100.0,
       yM: this.y,
       yCm: this.y * 100.0,
+      v: this.v,
       depthM: this.eta[1],
       depthCm: this.eta[1] * 100.0,
       pitchRad: this.eta[2],
       pitchDeg: (this.eta[2] * 180.0) / Math.PI,
+      rollRad: this.phi,
+      rollDeg: (this.phi * 180.0) / Math.PI,
+      rollRate: this.p,
       yawRad: this.yaw,
       yawDeg: (this.yaw * 180.0) / Math.PI,
       u: this.nu[0],
@@ -664,8 +814,14 @@ class AUVHydrodynamics2D {
       q: this.nu[2],
       uKmh: this.nu[0] * 3.6,
       thrustX: this.actualThrustX,
+      thrustY: this.actualThrustY,
       thrustZ: this.actualThrustZ,
+      commandThrustY: cmdThrustY,
+      commandThrustZ: cmdThrustZ,
       thrustQ: this.actualThrustQ,
+      thrustRoll: this.actualThrustRoll,
+      motorPulses,
+      depthHoldActive,
       netBuoyancyN: this.netBuoyancy,
       activeKp: this.pid.activeKp_z,
       activeKi: this.pid.baseKi_z,
@@ -682,17 +838,22 @@ class AUVHydrodynamics2D {
    */
   reset(xM = 1.0, depthM = 0.0, pitchRad = 0.0) {
     this.eta = [xM, depthM, pitchRad];
+    this.phi = 0.0;
+    this.p = 0.0;
     this.nu = [0.0, 0.0, 0.0];
+    this.y = 0.0;
+    this.v = 0.0;
     this.yaw = 0.0;
     this.r = 0.0;
     this.actualThrustX = 0.0;
+    this.actualThrustY = 0.0;
     this.actualThrustZ = 0.0;
     this.actualThrustQ = 0.0;
+    this.actualThrustRoll = 0.0;
     this.actualThrustYaw = 0.0;
     this.transientSurgeSpike = 0.0;
     this.transientHeaveSpike = 0.0;
     this.pid.integralZ = 0.0;
-    this.pid.integralTheta = 0.0;
   }
 }
 

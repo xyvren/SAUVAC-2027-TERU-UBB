@@ -15,7 +15,7 @@ struct MotorControlInterface {
   uint16_t (*getCurrentPulse)(size_t index);
   bool (*startMotorTest)(uint8_t id, float powerPercent, String& message);
   void (*emergencyStop)();
-  void (*setPidState)(bool enabled);
+  bool (*setPidState)(bool enabled);
   bool (*saveSettings)();
   void (*resetDefaults)();
 
@@ -33,12 +33,16 @@ struct MotorControlInterface {
 
   // Telemetry & Actuator hooks
   uint8_t (*getFsmState)();
-  void (*startEscCalib)();
-  void (*setRawPulseAll)(uint16_t pulseUs);
+  bool (*startEscCalib)();
+  bool (*setRawPulseAll)(uint16_t pulseUs);
+  bool (*setHilMode)(bool enabled);
+  bool (*setHilPulses)(const uint16_t* pulses);
+  bool (*isHilActive)();
 };
 
 void begin(const MotorControlInterface& iface);
 void update();
+void handleCommand(const String& rawCmd);
 void printBanner();
 void printPrompt();
 void logInfo(const char* fmt, ...);
